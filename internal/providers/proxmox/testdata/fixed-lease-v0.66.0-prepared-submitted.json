@@ -1,0 +1,42 @@
+{
+  "leaseID": "cbx_5ead00000001",
+  "revision": "fd7202e6d40b31de1a2ac4512be03f8d",
+  "slug": "fixed-submitted",
+  "provider": "proxmox-fixed-v1",
+  "cloudID": "102",
+  "cloudNumericID": 102,
+  "providerScope": "endpoint:https://pve.example.test:8006|node:pve1",
+  "targetOS": "linux",
+  "windowsMode": "normal",
+  "repoRoot": "/srv/crabbox",
+  "claimedAt": "2026-09-25T12:47:27Z",
+  "lastUsedAt": "2026-09-25T12:47:27Z",
+  "idleTimeoutSeconds": 7200,
+  "labels": {
+    "crabbox": "true",
+    "fixed_intent_sha256": "30d4ad712286ddec08b579b42c4a9f1cb0d87fe1a4d6ac9bf0b6f6949ab2f2fd",
+    "lease": "cbx_5ead00000001",
+    "node": "pve1",
+    "provider": "proxmox",
+    "provider_key": "crabbox-cbx-5ead00000001",
+    "slug": "fixed-submitted",
+    "template_id": "9400"
+  },
+  "fixedCreateIntent": {
+    "version": 1,
+    "fingerprint": "30d4ad712286ddec08b579b42c4a9f1cb0d87fe1a4d6ac9bf0b6f6949ab2f2fd",
+    "providerScope": "endpoint:https://pve.example.test:8006|node:pve1",
+    "slug": "fixed-submitted",
+    "createdAt": "2026-09-25T12:47:27.691140701Z",
+    "state": "prepared",
+    "attempt": {
+      "node": "pve1",
+      "vmid": "102"
+    },
+    "journal": {
+      "version": 1,
+      "phase": "submitting",
+      "revision": 3
+    }
+  }
+}
