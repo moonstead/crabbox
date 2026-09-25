@@ -236,6 +236,10 @@ async function authenticatedCoordinatorRequest(
 
 function portalCookieRequestIntentAllowed(request: Request, env: Env, url: URL): boolean {
   if (request.headers.get("authorization")) return true;
+  // The one-use viewer ticket is this route's only authentication, and the
+  // route replaces the viewer cookie. A cookie left by an earlier open must not
+  // stop a later open from another origin.
+  if (isWebVNCViewerBootstrap(request, url)) return true;
   const cookie = request.headers.get("cookie") ?? "";
   if (
     !cookieValue(cookie, portalSessionCookieName) &&
