@@ -263,10 +263,10 @@ fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme util-linux
 novnc websockify
 ```
 
-A template prepared with
 [`scripts/install-linux-desktop.sh`](../../scripts/install-linux-desktop.sh)
-already has these packages and compatible services. Crabbox still rewrites the
-services and replaces the VNC password in every clone.
+installs compatible services and most of these packages, but not `ffmpeg` or
+`wmctrl`; install those too. Crabbox still rewrites the services and replaces
+the VNC password in every clone.
 
 A browser template needs `gnupg`, `build-essential` and `python3`, plus a
 working `google-chrome-stable`, `chromium` or `chromium-browser` package. On
@@ -274,8 +274,12 @@ Ubuntu 24.04, `chromium-browser` is a transitional package for a snap, which
 `virt-customize` cannot install. Use Google Chrome from Google's signed
 repository or another working Chromium package instead. For example, add the
 packages with `virt-customize --install` before converting the image into a
-template. Do not leave a VNC password, browser profile or other
-credential in the template.
+template. The Ubuntu cloud image root filesystem is too small for these
+packages. Grow it in place first; `virt-resize` renumbers the partitions and the
+clone stops at a GRUB rescue prompt. Do not leave a VNC password, browser
+profile or other credential in the template. `virt-customize` also writes a
+machine ID, so empty `/etc/machine-id` last: clones that share one also share
+their systemd-networkd DHCP client identity.
 
 For each clone, the bootstrap:
 
