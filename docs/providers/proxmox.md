@@ -556,6 +556,15 @@ before the adapter confirms absence of the old one, the adapter keeps the old
 workspace's local cleanup pending until that VMID is gone. It never treats the
 new VM as the old workspace.
 
+If a fixed clone succeeds but bootstrap fails, the workspace moves to `stopping`
+before the adapter has recorded the VM's identity. The adapter replays the
+attempt to recover it. Replay never restarts bootstrap. When the claim has a
+bound generation and the VM's VMID, `vmgenid` and labels match it, replay
+reports that identity and still exits with `lease_id_conflict`. The adapter
+then deletes that VM with its checked `stop` and marks the workspace `failed`
+without waiting for `--create-timeout`. A VM without a bound or matching
+generation is never reported, so its workspace stays `stopping` for inspection.
+
 When the adapter confirms that a released VM is absent, it finishes cleanup and
 keeps the released claim as the lease ID's receipt, as direct `stop` does. If an
 acquisition failed before Crabbox wrote that claim, confirmed-absence cleanup
