@@ -13,6 +13,9 @@ Use this stack when:
 - provider credentials must stay on the adapter host.
 
 It is not a general reverse proxy, identity provider, WAF, or remote shell.
+An adapter operator can separately opt in to
+[workspace exec](runtime-adapter-exec.md), a bounded command channel into
+workspaces their owners already control.
 
 ## Components
 
@@ -80,7 +83,9 @@ sessions itself.
    accepting arbitrary provider commands from the request.
 
 The API exposes workspace operations, not shell commands, argv, environment,
-files, or provider credentials. Keep the bearer token between the fleet UI and
+files, or provider credentials. The only exception is opt-in
+[workspace exec](runtime-adapter-exec.md), which accepts argv only with an
+operator-authorised prefix. Keep the bearer token between the fleet UI and
 `adapter serve` private.
 
 ### Outbound coordinator control

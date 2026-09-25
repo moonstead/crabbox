@@ -195,10 +195,20 @@ Allowed operations are exactly:
 - `DELETE /v1/workspaces/{id}`
 - `POST /v1/workspaces/{id}/connections/desktop`
 - `POST /v1/workspaces/{id}/connections/native-vnc`
+- `POST /v1/workspaces/{id}/exec`, only with `--allow-exec`
 
-There is no arbitrary URL, shell, argv, environment, file, or provider-command
+There is no arbitrary URL, shell, environment, file, or provider-command
 surface. Request and response bodies are UTF-8 strings bounded to 64 KiB.
-Only workspace creation accepts a non-empty request body. Ordinary local
+Only workspace creation and exec accept a non-empty request body. An exec body
+is bounded to 256 KiB and must carry the coordinator's lease and registration
+binding.
+
+`--allow-exec` makes the connector advertise its exec budget,
+`--exec-timeout` plus 35 seconds, in the ticket request. Coordinators dispatch
+exec only to connectors that advertised it. Exec requests use their own lane of
+four. The coordinator may also send `{"type":"cancel","id":"<request id>"}` to
+cancel an in-flight exec whose caller went away or whose deadline passed. See
+[Runtime adapter workspace exec](../features/runtime-adapter-exec.md). Ordinary local
 requests time out after nine seconds, and the coordinator allows five more
 seconds for response delivery. Every frame carries that absolute Unix
 millisecond deadline; the connector rejects expired frames before local
@@ -237,6 +247,8 @@ Flags:
 --local-socket <path>          required current-user-owned Unix socket
 --token-file <path>            required local adapter bearer-token file
 --connection-timeout <duration> local desktop setup budget; default 2m
+--allow-exec                   relay opt-in workspace exec
+--exec-timeout <duration>      local exec budget; default 15m, at most 1h; match --exec-max-timeout
 ```
 
 ## HTTP API
@@ -402,6 +414,38 @@ transport restriction, and may not contain user information, query strings, or
 fragments. The adapter checks status, lease identity, and effective expiry
 again after setup and revokes the local bridge if the lifecycle changed.
 
+## Workspace exec
+
+Workspace exec is off by default. With at least one `--exec-allow`, the adapter
+accepts `"capabilities": {"exec": true}` at creation and serves:
+
+```http
+POST /v1/workspaces/{id}/exec
+Content-Type: application/json
+
+{"argv":["sh","-c","..."],"stdinBase64":"...","timeoutMs":600000,"leaseId":"cbx_abcdef123456"}
+```
+
+```sh
+crabbox adapter serve ... \
+  --exec-allow '["sh","-c"]' \
+  --exec-allow '["sh","-s","--"]' \
+  --exec-max-timeout 15m
+```
+
+The argv must start with one of the authorised prefixes. `leaseId` must be the
+workspace's current lease; an optional `registrationId` must be its current
+coordinator registration generation. The adapter runs the command on the
+workspace with `crabbox exec`, passing stdin only through a private pipe, and
+returns the exit status and the last 16 KiB of stdout and stderr. DELETE,
+expiry, durability loss, client disconnection and timeout stop the command and
+withhold its output. `adapter serve` refuses to start with `--exec-allow`
+unless `crabbox exec --check` reports execution support for its provider.
+Workspaces advertise `"exec": true` in their capabilities while it is enabled.
+
+Read [Runtime adapter workspace exec](../features/runtime-adapter-exec.md) for
+the complete contract, limits, audit line and relay behavior.
+
 ## Lifecycle and recovery
 
 The adapter holds an exclusive process-lifetime lock beside the state file.
@@ -540,9 +584,11 @@ Flags:
 --forbid-server-type-override    reject nonempty request serverType values
 --crabbox-binary <path>          lifecycle executable
 --work-dir <path>                lifecycle working directory
+--exec-allow <json-argv-prefix>  authorise workspace exec for this argv prefix; repeatable; flag only
+--exec-max-timeout <duration>    default 15m; at most 1h
 ```
 
-Every flag has a `CRABBOX_ADAPTER_*` environment equivalent. Flags override
+Every flag except `--exec-allow` has a `CRABBOX_ADAPTER_*` environment equivalent. Flags override
 environment values. Provider credentials remain in the provider's normal
 credential store or child environment; never put them in HTTP requests.
 

@@ -379,7 +379,7 @@ func TestAdapterRelayServesDeleteWhileDesktopRequestIsInFlight(t *testing.T) {
 		Client:  coordinator.Client(),
 	}, "mac-lab", local.URL, "/test/adapter.sock", func() (string, error) {
 		return "local-token", nil
-	}, local.Client(), 150*time.Second, io.Discard)
+	}, local.Client(), 150*time.Second, 0, io.Discard)
 	var closeError websocket.CloseError
 	if err == nil || !errors.As(err, &closeError) || closeError.Code != websocket.StatusNormalClosure {
 		t.Fatalf("relay close error=%v", err)
@@ -503,6 +503,7 @@ func TestConnectAdapterRelayUsesTicketHeaderAndRelaysResponse(t *testing.T) {
 		func() (string, error) { return "local-token", nil },
 		local.Client(),
 		150*time.Second,
+		0,
 		&status,
 	)
 	var closeError websocket.CloseError
@@ -548,7 +549,7 @@ func TestConnectAdapterRelayBoundsTicketAcquisition(t *testing.T) {
 	started := time.Now()
 	err := connectAdapterRelay(
 		context.Background(), coord, "mac-lab", "http://127.0.0.1", "/test/adapter.sock",
-		func() (string, error) { return "local-token", nil }, http.DefaultClient, 150*time.Second, io.Discard,
+		func() (string, error) { return "local-token", nil }, http.DefaultClient, 150*time.Second, 0, io.Discard,
 	)
 	if err == nil || !strings.Contains(err.Error(), "create adapter ticket") {
 		t.Fatalf("relay ticket error=%v", err)

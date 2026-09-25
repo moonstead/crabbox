@@ -52,6 +52,13 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 	forbidServerTypeOverride := fs.Bool("forbid-server-type-override", controllerEnvBool("CRABBOX_ADAPTER_FORBID_SERVER_TYPE_OVERRIDE"), "reject nonempty request serverType values")
 	binary := fs.String("crabbox-binary", getenv("CRABBOX_ADAPTER_BINARY", defaultBinary), "Crabbox executable used for lifecycle commands")
 	workDir := fs.String("work-dir", getenv("CRABBOX_ADAPTER_WORK_DIR", ""), "working directory for lifecycle commands")
+	var execAllow [][]string
+	fs.Func("exec-allow", `authorise workspace exec for argv starting with this JSON array, for example '["sh","-c"]' (repeatable)`, func(value string) error {
+		var err error
+		execAllow, err = parseControllerExecAllow(value, execAllow)
+		return err
+	})
+	execMaxTimeout := fs.Duration("exec-max-timeout", controllerEnvDuration("CRABBOX_ADAPTER_EXEC_MAX_TIMEOUT", controllerExecDefaultMaxTimeout), "maximum workspace exec duration")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -80,6 +87,9 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 		if value <= 0 {
 			return Exit(2, "--%s must be greater than zero", name)
 		}
+	}
+	if len(execAllow) > 0 && (*execMaxTimeout < controllerExecMinTimeout || *execMaxTimeout > controllerExecMaximumTimeout) {
+		return Exit(2, "--exec-max-timeout must be between %s and %s", controllerExecMinTimeout, controllerExecMaximumTimeout)
 	}
 	if strings.TrimSpace(*vncURLTemplate) != "" && !*allowDesktop {
 		return Exit(2, "--vnc-url-template requires --allow-desktop")
@@ -116,6 +126,8 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 		RequiredIdleSeconds:      requiredIdleSeconds,
 		ForbidClassOverride:      *forbidClassOverride,
 		ForbidServerTypeOverride: *forbidServerTypeOverride,
+		ExecAllow:                execAllow,
+		ExecMaxTimeout:           *execMaxTimeout,
 	}
 	runnerConfig := expandUserPath(strings.TrimSpace(*configPath))
 	runnerProvider := strings.TrimSpace(*provider)
@@ -167,7 +179,7 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 		Handler:           service,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      *connectionTimeout + 10*time.Second,
+		WriteTimeout:      controllerWriteTimeout(*connectionTimeout, execAllow, *execMaxTimeout),
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		BaseContext: func(net.Listener) context.Context {
@@ -176,6 +188,10 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 	}
 	service.startReconciliation()
 	fmt.Fprintf(a.Stderr, "adapter listening=%s state=%s provider=%s profile=%s id=%s max_concurrent=%d\n", strings.Join(listenerNames, ","), opts.StateFile, blank(*provider, "config"), blank(*profile, "default"), blank(*adapterID, "unbound"), opts.MaxConcurrent)
+	if len(execAllow) > 0 {
+		// Report the policy size only; argv never enters adapter logs.
+		fmt.Fprintf(a.Stderr, "adapter workspace exec enabled prefixes=%d max_timeout=%s\n", len(execAllow), *execMaxTimeout)
+	}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -351,4 +367,14 @@ func controllerEnvDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+// controllerWriteTimeout bounds each response by the longest request the
+// adapter can legitimately be serving.
+func controllerWriteTimeout(connectionTimeout time.Duration, execAllow [][]string, execMaxTimeout time.Duration) time.Duration {
+	longest := connectionTimeout
+	if len(execAllow) > 0 {
+		longest = max(longest, execMaxTimeout)
+	}
+	return longest + 10*time.Second
 }
