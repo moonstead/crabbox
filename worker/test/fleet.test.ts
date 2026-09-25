@@ -77,6 +77,7 @@ import { setPoolWake } from "../src/ready-pool-wake";
 import { verifyTerminalReceipt } from "../src/run-receipt";
 import {
   runtimeAdapterDesktopRelayTimeoutMs,
+  runtimeAdapterExecBodyLimit,
   runtimeAdapterRelayFrameLimit,
   runtimeAdapterRelayTimeoutMs,
 } from "../src/runtime-adapter-relay";
@@ -5784,6 +5785,334 @@ describe("runtime adapter relay", () => {
     await expect(proxied.json()).resolves.toEqual({
       id: "example-workspace-1",
       status: "provisioning",
+    });
+  });
+});
+
+describe("runtime adapter workspace exec", () => {
+  const execSecret = "enrolment-secret-5f2c9e";
+  const headers = {
+    "x-crabbox-owner": "alice@example.com",
+    "x-crabbox-org": "example-org",
+  };
+  const execPath = "/v1/adapters/example-adapter/proxy/v1/workspaces/example-workspace-7/exec";
+  const execBody = {
+    argv: [
+      "sh",
+      "-c",
+      "cat >/dev/null",
+      "bb-machine-install",
+      "https://bb.example.test/install.sh",
+    ],
+    stdinBase64: btoa(execSecret),
+    timeoutMs: 600_000,
+  };
+
+  function execFixture(
+    options: {
+      execTimeoutMs?: number;
+      lease?: Partial<LeaseRecord>;
+    } = {},
+  ) {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const lease = testLease({
+      id: "cbx_000000000007",
+      slug: "exec-box",
+      provider: "proxmox",
+      lifecycle: "registered",
+      runtimeAdapterID: "example-adapter",
+      runtimeAdapterWorkspaceID: "example-workspace-7",
+      runtimeAdapterRegistrationID: "registration-generation-7",
+      owner: "alice@example.com",
+      org: "example-org",
+      keep: true,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      ...options.lease,
+    });
+    storage.seed("runtime-adapter-identity:example-adapter", {
+      adapterID: "example-adapter",
+      owner: "alice@example.com",
+      org: "example-org",
+      createdAt: "2026-06-01T00:00:00.000Z",
+    });
+    storage.seed(`lease:${lease.id}`, lease);
+    const socket = new FakeWebSocket({
+      kind: "runtime-adapter-agent",
+      adapterID: "example-adapter",
+      owner: "alice@example.com",
+      org: "example-org",
+      ...(options.execTimeoutMs === null
+        ? {}
+        : { execTimeoutMs: options.execTimeoutMs ?? 15 * 60 * 1000 + 35_000 }),
+    });
+    const relayState = fleet as unknown as {
+      runtimeAdapterAgents: Map<string, WebSocket>;
+      runtimeAdapterPending: Map<string, unknown>;
+    };
+    relayState.runtimeAdapterAgents.set("example-adapter", socket as unknown as WebSocket);
+    return { storage, fleet, lease, socket, relayState };
+  }
+
+  function respond(
+    fleet: ReturnType<typeof testFleet>,
+    socket: FakeWebSocket,
+    id: string,
+    status: number,
+    body: unknown,
+  ): void {
+    void fleet.webSocketMessage(
+      socket as unknown as WebSocket,
+      JSON.stringify({
+        type: "response",
+        id,
+        status,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+  }
+
+  type SentFrame = { type: string; id: string; path?: string; body?: string; deadlineMs?: number };
+
+  it("relays only for the owner of the bound live lease and stamps its generation", async () => {
+    const { fleet, lease, socket } = execFixture();
+    socket.onSend = (data) => {
+      const frame = JSON.parse(data) as SentFrame;
+      if (frame.type !== "request") return;
+      respond(fleet, socket, frame.id, 200, {
+        exitCode: 0,
+        stdoutBase64: btoa("ok"),
+        stderrBase64: "",
+      });
+    };
+    const response = await fleet.fetch(request("POST", execPath, { headers, body: execBody }));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({ exitCode: 0, stdoutBase64: btoa("ok") });
+    const [frame] = socket.sentJSON() as SentFrame[];
+    expect(frame).toMatchObject({
+      type: "request",
+      method: "POST",
+      path: "/v1/workspaces/example-workspace-7/exec",
+    });
+    expect(JSON.parse(frame!.body!)).toEqual({
+      ...execBody,
+      leaseId: lease.id,
+      registrationId: "registration-generation-7",
+    });
+    expect(frame!.deadlineMs!).toBeLessThanOrEqual(Date.parse(lease.expiresAt));
+
+    const denials = [
+      [
+        "another owner",
+        {
+          headers: { "x-crabbox-owner": "mallory@example.com", "x-crabbox-org": "example-org" },
+          body: execBody,
+        },
+        403,
+        "runtime_adapter_forbidden",
+      ],
+      [
+        "stale registration",
+        { headers, body: { ...execBody, registrationId: "registration-generation-6" } },
+        409,
+        "workspace_generation_mismatch",
+      ],
+      [
+        "another lease",
+        { headers, body: { ...execBody, leaseId: "cbx_000000000008" } },
+        409,
+        "workspace_generation_mismatch",
+      ],
+    ] as const;
+    const denied = await Promise.all(
+      denials.map(async ([name, init, status, error]) => {
+        const deniedResponse = await fleet.fetch(request("POST", execPath, init));
+        return {
+          name,
+          status: deniedResponse.status,
+          body: await deniedResponse.json(),
+          expected: { name, status, error },
+        };
+      }),
+    );
+    for (const result of denied) {
+      expect({ name: result.name, status: result.status }).toEqual({
+        name: result.expected.name,
+        status: result.expected.status,
+      });
+      expect(result.body).toMatchObject({ error: result.expected.error });
+    }
+    const otherWorkspace = await fleet.fetch(
+      request("POST", "/v1/adapters/example-adapter/proxy/v1/workspaces/example-workspace-8/exec", {
+        headers,
+        body: execBody,
+      }),
+    );
+    expect(otherWorkspace.status).toBe(404);
+    await expect(otherWorkspace.json()).resolves.toMatchObject({
+      error: "runtime_adapter_workspace_not_found",
+    });
+    expect(socket.sentJSON()).toHaveLength(1);
+  });
+
+  it("refuses expired, released or deleting leases before dispatch", async () => {
+    const leases: Partial<LeaseRecord>[] = [
+      { expiresAt: new Date(Date.now() - 1000).toISOString() },
+      { state: "released" },
+      { runtimeAdapterDeleteRequestedAt: new Date().toISOString() },
+    ];
+    const results = await Promise.all(
+      leases.map(async (lease) => {
+        const { fleet, socket } = execFixture({ lease });
+        const response = await fleet.fetch(request("POST", execPath, { headers, body: execBody }));
+        return { status: response.status, sent: socket.sentJSON().length };
+      }),
+    );
+    for (const result of results) {
+      expect([404, 409]).toContain(result.status);
+      expect(result.sent).toBe(0);
+    }
+  });
+
+  it("denies exec when the connector did not opt in", async () => {
+    const { fleet, socket } = execFixture({ execTimeoutMs: null as unknown as number });
+    const response = await fleet.fetch(request("POST", execPath, { headers, body: execBody }));
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "runtime_adapter_exec_unavailable",
+    });
+    expect(socket.sentJSON()).toHaveLength(0);
+  });
+
+  it("rejects malformed and oversized requests without quoting private input", async () => {
+    const { fleet, socket } = execFixture();
+    const bodies: unknown[] = [
+      { ...execBody, env: { TOKEN: execSecret } },
+      { ...execBody, argv: [] },
+      { ...execBody, argv: ["sh", "-c", `a\0${execSecret}`] },
+      { ...execBody, stdinBase64: `${execSecret}!` },
+      { ...execBody, timeoutMs: 60 * 60 * 1000 + 1 },
+      { ...execBody, timeoutMs: undefined },
+      [execSecret],
+    ];
+    const rejected = await Promise.all(
+      bodies.map(async (body) => {
+        const response = await fleet.fetch(request("POST", execPath, { headers, body }));
+        return { status: response.status, text: await response.text() };
+      }),
+    );
+    for (const result of rejected) {
+      expect(result.status).toBe(400);
+      expect(result.text).not.toContain(execSecret);
+    }
+    const oversized = await fleet.fetch(
+      request("POST", execPath, {
+        headers,
+        body: { ...execBody, stdinBase64: "A".repeat(runtimeAdapterExecBodyLimit) },
+      }),
+    );
+    expect(oversized.status).toBe(413);
+    const wrongMethod = await fleet.fetch(request("GET", execPath, { headers }));
+    expect(wrongMethod.status).toBe(405);
+    expect(socket.sentJSON()).toHaveLength(0);
+  });
+
+  it("cancels the adapter command when the caller goes away", async () => {
+    const { fleet, socket, relayState } = execFixture();
+    const controller = new AbortController();
+    const base = request("POST", execPath, { headers, body: execBody });
+    const pending = fleet.fetch(new Request(base, { signal: controller.signal }));
+    await vi.waitFor(() => expect(socket.sentJSON()).toHaveLength(1));
+    const [frame] = socket.sentJSON() as SentFrame[];
+    controller.abort();
+    const response = await pending;
+    expect(response.status).toBe(499);
+    expect(socket.sentJSON()[1]).toEqual({ type: "cancel", id: frame!.id });
+    // The withdrawn command stays counted until the adapter answers.
+    expect(relayState.runtimeAdapterPending.size).toBe(1);
+    respond(fleet, socket, frame!.id, 409, { error: { code: "workspace_lifecycle_changed" } });
+    await vi.waitFor(() => expect(relayState.runtimeAdapterPending.size).toBe(0));
+  });
+
+  it("stops the command at lease expiry", async () => {
+    const { fleet, socket, relayState } = execFixture({
+      lease: { expiresAt: new Date(Date.now() + 150).toISOString() },
+    });
+    const response = await fleet.fetch(request("POST", execPath, { headers, body: execBody }));
+    expect(response.status).toBe(504);
+    const frames = socket.sentJSON() as SentFrame[];
+    expect(frames).toHaveLength(2);
+    expect(frames[1]).toEqual({ type: "cancel", id: frames[0]!.id });
+    expect(relayState.runtimeAdapterPending.size).toBe(0);
+  });
+
+  it("cancels on lease deletion and never releases stale output", async () => {
+    const { fleet, lease, socket } = execFixture();
+    let execID = "";
+    socket.onSend = (data) => {
+      const frame = JSON.parse(data) as SentFrame & { method?: string };
+      if (frame.type === "request" && frame.method === "POST") execID = frame.id;
+      if (frame.type === "request" && frame.method === "DELETE") {
+        respond(fleet, socket, frame.id, 202, { id: "example-workspace-7", status: "stopping" });
+      }
+    };
+    const running = fleet.fetch(request("POST", execPath, { headers, body: execBody }));
+    await vi.waitFor(() => expect(execID).not.toBe(""));
+    const released = await fleet.fetch(
+      request("POST", `/v1/leases/${lease.id}/release`, { headers, body: { delete: true } }),
+    );
+    expect(released.status).toBe(202);
+    const response = await running;
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ error: "workspace_lifecycle_changed" });
+    expect(socket.sentJSON()).toContainEqual({ type: "cancel", id: execID });
+    // A late adapter result for the withdrawn command is discarded.
+    respond(fleet, socket, execID, 200, { exitCode: 0, stdoutBase64: btoa("stale-output") });
+    const retry = await fleet.fetch(request("POST", execPath, { headers, body: execBody }));
+    expect(retry.status).toBe(409);
+  });
+
+  it("withholds a result when the lease generation changed during the command", async () => {
+    const { fleet, storage, lease, socket } = execFixture();
+    socket.onSend = (data) => {
+      const frame = JSON.parse(data) as SentFrame;
+      if (frame.type !== "request") return;
+      storage.seed(`lease:${lease.id}`, {
+        ...storage.value<LeaseRecord>(`lease:${lease.id}`)!,
+        runtimeAdapterRegistrationID: "registration-generation-8",
+      });
+      respond(fleet, socket, frame.id, 200, { exitCode: 0, stdoutBase64: btoa("stale-output") });
+    };
+    const response = await fleet.fetch(request("POST", execPath, { headers, body: execBody }));
+    expect(response.status).toBe(409);
+    const text = await response.text();
+    expect(text).toContain("workspace_lifecycle_changed");
+    expect(text).not.toContain(btoa("stale-output"));
+  });
+
+  it("records the connector's exec budget only within the supported range", async () => {
+    const storage = new MemoryStorage();
+    const fleet = testFleet(storage);
+    const invalid = await fleet.fetch(
+      request("POST", "/v1/adapters/example-adapter/ticket", {
+        headers,
+        body: { execTimeoutMs: 2 * 60 * 60 * 1000 },
+      }),
+    );
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({ error: "invalid_exec_timeout" });
+    const accepted = await fleet.fetch(
+      request("POST", "/v1/adapters/example-adapter/ticket", {
+        headers,
+        body: { execTimeoutMs: 15 * 60 * 1000 + 35_000 },
+      }),
+    );
+    expect(accepted.status).toBe(200);
+    const { ticket } = (await accepted.json()) as { ticket: string };
+    expect(storage.value(`runtime-adapter-ticket:${ticket}`)).toMatchObject({
+      execTimeoutMs: 15 * 60 * 1000 + 35_000,
     });
   });
 });

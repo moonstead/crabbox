@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -22,6 +23,9 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 	id := fs.String("id", "", "canonical lease id")
 	pty := fs.Bool("pty", false, "allocate a remote pseudo-terminal")
 	check := fs.Bool("check", false, "print configured execution and fixed-ID repository cleanup capabilities offline as JSON")
+	statusFD := fs.Int("status-fd", -1, "write supervisor status events as JSON lines to this inherited descriptor")
+	expectRegistration := fs.String("expect-runtime-registration", "", "require this runtime adapter registration generation on the lease claim")
+	terminateRemote := fs.Bool("terminate-remote-on-disconnect", false, "terminate the remote process group when the SSH session ends")
 	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
 	networkFlags := registerNetworkModeFlag(fs, defaults)
@@ -32,8 +36,16 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 		return err
 	}
 	command := fs.Args()
-	if *check && (*id != "" || *pty || len(command) != 0) {
-		return Exit(2, "exec --check cannot combine a lease ID, --pty, or a command")
+	supervisor := execSupervisorOptions{
+		statusFD:           *statusFD,
+		expectRegistration: strings.TrimSpace(*expectRegistration),
+		terminateRemote:    *terminateRemote,
+	}
+	if *check && (*id != "" || *pty || len(command) != 0 || supervisor.enabled()) {
+		return Exit(2, "exec --check cannot combine a lease ID, --pty, a command, or supervisor options")
+	}
+	if err := supervisor.validate(*pty); err != nil {
+		return err
 	}
 	if !*check && (!IsCanonicalLeaseID(*id) || len(command) == 0) {
 		return Exit(2, "usage: crabbox exec --id <canonical-lease-id> [--pty] -- <command> [args...]")
@@ -64,8 +76,18 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	status, err := openExecStatus(supervisor.statusFD)
+	if err != nil {
+		return err
+	}
+	defer status.Close()
 	providerRuntime := runtimeForApp(a)
 	providerRuntime.Stdout = a.Stderr
+	if status != nil {
+		// A supervisor returns command stderr to its caller. Provider preparation
+		// diagnostics are not command output, so keep them out of that stream.
+		providerRuntime.Stdout = io.Discard
+	}
 	backend, err := loadBackend(cfg, providerRuntime)
 	if err != nil {
 		return err
@@ -94,6 +116,14 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 		}
 		if err := AuthorizeCheckpointRelease(claim, ""); err != nil {
 			return err
+		}
+		if supervisor.expectRegistration != "" && !runtimeAdapterRegistrationCurrent(claim, supervisor.expectRegistration) {
+			// The shared fence excludes registration rotation and release until
+			// this command and its transport cleanup finish.
+			if err := status.Write(execStatusEvent{Event: "rejected", Reason: "registration"}); err != nil {
+				return err
+			}
+			return Exit(4, "lease %s is not bound to the expected runtime adapter registration", *id)
 		}
 		// This resolver contract cannot publish or reenter claim operations. The
 		// shared fence lets independent commands run but excludes claim writers.
@@ -124,7 +154,7 @@ func (a App) execCommand(ctx context.Context, args []string) error {
 			}
 			defer stop()
 		}
-		return a.execSSHCommand(ctx, lease.SSH, command, *pty)
+		return a.execSSHCommand(ctx, lease.SSH, command, *pty, supervisor.terminateRemote, status)
 	})
 }
 
@@ -154,7 +184,7 @@ func execCapabilitiesForConfig(cfg Config) (execCapabilities, error) {
 	}, nil
 }
 
-func (a App) execSSHCommand(ctx context.Context, target SSHTarget, command []string, pty bool) (err error) {
+func (a App) execSSHCommand(ctx context.Context, target SSHTarget, command []string, pty, terminateRemote bool, status *execStatus) (err error) {
 	target.NoControlMaster = true
 	session, err := newSSHTransportSession(ctx, target, false)
 	if err != nil {
@@ -175,15 +205,26 @@ func (a App) execSSHCommand(ctx context.Context, target SSHTarget, command []str
 	if target.AuthSecret {
 		args = append(args, "-o", "LogLevel=QUIET")
 	}
-	args = append(args, session.host(), "exec "+strings.Join(shellWords(command), " "))
-	handle := newOwnedSSHTransportCommand(ctx, target, args)
+	remote := "exec " + strings.Join(shellWords(command), " ")
+	if terminateRemote {
+		remote = execRemoteSessionGuardCommand(command)
+	}
+	args = append(args, session.host(), remote)
+	commandCtx, cancelCommand := context.WithCancelCause(ctx)
+	defer cancelCommand(context.Canceled)
+	handle := newOwnedSSHTransportCommand(commandCtx, target, args)
 	handle.cmd.Stdin = a.input()
 	handle.cmd.Stdout = a.Stdout
 	handle.cmd.Stderr = a.Stderr
 	if err := handle.Start(); err != nil {
 		return fmt.Errorf("start SSH command: %w", err)
 	}
-	err = waitOwnedSSHTransportCommand(ctx, handle)
+	if err := status.Write(execStatusEvent{Event: "started"}); err != nil {
+		// A supervisor that cannot observe the start must not receive an exit
+		// status it would misclassify as a setup failure.
+		cancelCommand(err)
+	}
+	err = waitOwnedSSHTransportCommand(commandCtx, handle)
 	if cleanupErr := handle.joinCancellationError(handle.finishPondMeshPlatform()); cleanupErr != nil {
 		return fmt.Errorf("SSH process cleanup failed: %v (command outcome: %v)", cleanupErr, err)
 	}

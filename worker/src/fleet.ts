@@ -351,7 +351,13 @@ import {
 } from "./provider-reconciliation";
 import { sameTerminalRunBinding, terminalFinishSHA256, verifyTerminalReceipt } from "./run-receipt";
 import {
+  parseRuntimeAdapterExecRequest,
   readRuntimeAdapterRelayBody,
+  runtimeAdapterExecBodyLimit,
+  runtimeAdapterExecMaxPendingPerAdapter,
+  runtimeAdapterExecPath,
+  runtimeAdapterExecRelayBody,
+  runtimeAdapterExecRelayOverheadMs,
   runtimeAdapterProxyPath,
   runtimeAdapterRelayBodyAllowed,
   runtimeAdapterRelayContentType,
@@ -362,7 +368,9 @@ import {
   runtimeAdapterRelayTimeoutMs,
   validRuntimeAdapterID,
   validRuntimeAdapterDesktopRelayTimeout,
+  validRuntimeAdapterExecRelayTimeout,
   validRuntimeAdapterRelayResponse,
+  type RuntimeAdapterRelayCancel,
   type RuntimeAdapterRelayRequest,
   type RuntimeAdapterRelayResponse,
 } from "./runtime-adapter-relay";
@@ -663,6 +671,7 @@ interface RuntimeAdapterTicketRecord {
   createdAt: string;
   expiresAt: string;
   desktopTimeoutMs?: number;
+  execTimeoutMs?: number;
 }
 
 interface RuntimeAdapterIdentityRecord {
@@ -686,6 +695,8 @@ interface RuntimeAdapterPendingRequest {
   timeout: ReturnType<typeof setTimeout>;
   signal: AbortSignal;
   abortHandler: () => void;
+  /** Present for workspace exec, which the adapter must stop when withdrawn. */
+  exec?: { leaseID: string; agent: WebSocket };
 }
 
 interface RuntimeAdapterRelayResult {
@@ -1065,6 +1076,8 @@ type BridgeAttachment =
       owner: string;
       org: string;
       desktopTimeoutMs?: number;
+      /** Set only when the connector opted in to relaying workspace exec. */
+      execTimeoutMs?: number;
     }
   | {
       kind: "control";
@@ -9563,6 +9576,9 @@ export class FleetCoordinator {
       }
       current.updatedAt = now.toISOString();
       await this.putLease(current);
+      // Exec admission runs in this same exclusive section, so no command can
+      // be dispatched for this lease after the deletion is recorded.
+      this.cancelRuntimeAdapterExecForLease(current.id);
       await this.scheduleAlarm();
       return { requestedAt: current.runtimeAdapterDeleteRequestedAt, claimID, created };
     });
@@ -10249,7 +10265,7 @@ export class FleetCoordinator {
     if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) {
       return json({ error: "invalid_adapter_ticket_request" }, { status: 400 });
     }
-    const input = rawInput as { desktopTimeoutMs?: unknown };
+    const input = rawInput as { desktopTimeoutMs?: unknown; execTimeoutMs?: unknown };
     if (
       input.desktopTimeoutMs !== undefined &&
       !validRuntimeAdapterDesktopRelayTimeout(input.desktopTimeoutMs)
@@ -10258,6 +10274,18 @@ export class FleetCoordinator {
         {
           error: "invalid_desktop_timeout",
           message: "desktop timeout is outside the supported relay range",
+        },
+        { status: 400 },
+      );
+    }
+    if (
+      input.execTimeoutMs !== undefined &&
+      !validRuntimeAdapterExecRelayTimeout(input.execTimeoutMs)
+    ) {
+      return json(
+        {
+          error: "invalid_exec_timeout",
+          message: "exec timeout is outside the supported relay range",
         },
         { status: 400 },
       );
@@ -10317,6 +10345,7 @@ export class FleetCoordinator {
       createdAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + runtimeAdapterTicketTTLSeconds * 1000).toISOString(),
       ...(input.desktopTimeoutMs === undefined ? {} : { desktopTimeoutMs: input.desktopTimeoutMs }),
+      ...(input.execTimeoutMs === undefined ? {} : { execTimeoutMs: input.execTimeoutMs }),
     };
     await this.state.storage.put(runtimeAdapterTicketKey(ticket.ticket), ticket);
     return json({
@@ -10381,6 +10410,7 @@ export class FleetCoordinator {
       ...(ticket.desktopTimeoutMs === undefined
         ? {}
         : { desktopTimeoutMs: ticket.desktopTimeoutMs }),
+      ...(ticket.execTimeoutMs === undefined ? {} : { execTimeoutMs: ticket.execTimeoutMs }),
     });
     return upgrade.response;
   }
@@ -10417,6 +10447,13 @@ export class FleetCoordinator {
     adapterID: string,
     proxyParts: string[],
   ): Promise<Response> {
+    const execPath = runtimeAdapterExecPath(proxyParts);
+    if (execPath) {
+      if (request.method.toUpperCase() !== "POST") {
+        return json({ error: "method_not_allowed" }, { status: 405, headers: { allow: "POST" } });
+      }
+      return await this.runtimeAdapterExec(request, adapterID, proxyParts[2]!, execPath);
+    }
     const path = runtimeAdapterProxyPath(proxyParts);
     const method = request.method.toUpperCase();
     if (path && method === "DELETE" && runtimeAdapterRelayMethodAllowed(method, path)) {
@@ -10430,6 +10467,270 @@ export class FleetCoordinator {
       );
     }
     return (await this.runtimeAdapterProxyResult(request, adapterID, proxyParts)).response;
+  }
+
+  /**
+   * Relays one command to a workspace the caller owns. Admission and dispatch
+   * run in the same exclusive section as delete marking, so a command cannot
+   * start after its workspace's deletion has been recorded. The request body
+   * carries private stdin; it is never stored, logged or quoted.
+   */
+  private async runtimeAdapterExec(
+    request: Request,
+    adapterID: string,
+    workspaceID: string,
+    path: string,
+  ): Promise<Response> {
+    if (!validRuntimeAdapterID(adapterID)) {
+      return notFound();
+    }
+    const owner = requestOwner(request);
+    const org = requestOrg(request, this.env);
+    const identity = await this.state.storage.get<RuntimeAdapterIdentityRecord>(
+      runtimeAdapterIdentityKey(adapterID),
+    );
+    if (!identity || identity.adapterID !== adapterID) {
+      return json(
+        { error: "runtime_adapter_unclaimed", message: "runtime adapter id has not been claimed" },
+        { status: 409 },
+      );
+    }
+    // There is no administrator bypass: only the principal that owns both the
+    // adapter and the workspace lease may run commands in it.
+    if (!isCurrentOrgKey(identity.org) || identity.owner !== owner || identity.org !== org) {
+      return json(
+        {
+          error: "runtime_adapter_forbidden",
+          message: "runtime adapter belongs to another owner or organization",
+        },
+        { status: 403 },
+      );
+    }
+    let body: string | undefined;
+    try {
+      body = await readRuntimeAdapterRelayBody(request, runtimeAdapterExecBodyLimit);
+    } catch (error) {
+      if (error instanceof RangeError) {
+        return json({ error: "request_too_large", message: error.message }, { status: 413 });
+      }
+      if (error instanceof TypeError) {
+        return json(
+          { error: "invalid_request_body", message: "runtime adapter body must be valid UTF-8" },
+          { status: 400 },
+        );
+      }
+      throw error;
+    }
+    const execRequest = body === undefined ? undefined : parseRuntimeAdapterExecRequest(body);
+    body = undefined;
+    if (!execRequest) {
+      return json(
+        {
+          error: "invalid_exec_request",
+          message:
+            "exec requires one JSON object with argv, timeoutMs and optional stdinBase64, leaseId and registrationId",
+        },
+        { status: 400 },
+      );
+    }
+    const admission = await this.state.runExclusive(async () => {
+      const bound = (await this.leaseRecords()).filter(
+        (lease) =>
+          isRegisteredLease(lease) &&
+          lease.runtimeAdapterID === adapterID &&
+          lease.runtimeAdapterWorkspaceID === workspaceID &&
+          (leaseIsLive(lease) || Boolean(lease.runtimeAdapterDeleteRequestedAt)),
+      );
+      if (bound.length === 0) {
+        return json(
+          {
+            error: "runtime_adapter_workspace_not_found",
+            message: "no live registered lease is bound to this runtime adapter workspace",
+          },
+          { status: 404 },
+        );
+      }
+      const lease = bound[0]!;
+      if (bound.length !== 1 || lease.owner !== owner || lease.org !== org) {
+        return json(
+          {
+            error: "runtime_adapter_forbidden",
+            message: "the workspace lease belongs to another owner or organization",
+          },
+          { status: 403 },
+        );
+      }
+      const now = Date.now();
+      const expiresAt = Date.parse(lease.expiresAt);
+      if (
+        lease.state !== "active" ||
+        lease.runtimeAdapterDeleteRequestedAt ||
+        !Number.isFinite(expiresAt) ||
+        expiresAt <= now
+      ) {
+        return json(
+          {
+            error: "workspace_not_ready",
+            message: "the workspace lease is not active, is expired or is being deleted",
+          },
+          { status: 409 },
+        );
+      }
+      const registrationID = lease.runtimeAdapterRegistrationID;
+      if (
+        !validRuntimeAdapterID(registrationID) ||
+        (execRequest.leaseId !== undefined && execRequest.leaseId !== lease.id) ||
+        (execRequest.registrationId !== undefined && execRequest.registrationId !== registrationID)
+      ) {
+        return json(
+          {
+            error: "workspace_generation_mismatch",
+            message: "the request does not match the workspace's current lease generation",
+          },
+          { status: 409 },
+        );
+      }
+      const agent = this.runtimeAdapterAgents.get(adapterID);
+      const attachment = agent ? this.bridgeAttachment(agent) : undefined;
+      if (
+        !agent ||
+        agent.readyState !== WebSocket.OPEN ||
+        attachment?.kind !== "runtime-adapter-agent" ||
+        attachment.owner !== identity.owner ||
+        attachment.org !== identity.org
+      ) {
+        return json(
+          { error: "runtime_adapter_unavailable", message: "runtime adapter is not connected" },
+          { status: 503 },
+        );
+      }
+      if (attachment.execTimeoutMs === undefined) {
+        return json(
+          {
+            error: "runtime_adapter_exec_unavailable",
+            message: "the connected runtime adapter does not offer workspace exec",
+          },
+          { status: 409 },
+        );
+      }
+      let execPending = 0;
+      for (const pending of this.runtimeAdapterPending.values()) {
+        if (pending.adapterID === adapterID && pending.exec) execPending += 1;
+      }
+      if (
+        execPending >= runtimeAdapterExecMaxPendingPerAdapter ||
+        this.runtimeAdapterRelayAtCapacity(adapterID, identity, "POST")
+      ) {
+        return json(
+          {
+            error: "runtime_adapter_busy",
+            message: "runtime adapter relay has too many in-flight requests",
+          },
+          { status: 429, headers: { "retry-after": "1" } },
+        );
+      }
+      const bufferedAmount = (agent as WebSocket & { readonly bufferedAmount?: number })
+        .bufferedAmount;
+      if (typeof bufferedAmount === "number" && bufferedAmount > runtimeAdapterMaxBufferedBytes) {
+        return json(
+          {
+            error: "runtime_adapter_backpressure",
+            message: "runtime adapter relay transport is congested",
+          },
+          { status: 503, headers: { "retry-after": "1" } },
+        );
+      }
+      // A command never outlives the lease that authorised it.
+      const deadlineMs = Math.min(
+        now + execRequest.timeoutMs + runtimeAdapterExecRelayOverheadMs,
+        now + attachment.execTimeoutMs,
+        expiresAt,
+      );
+      const id = crypto.randomUUID();
+      const relayRequest: RuntimeAdapterRelayRequest = {
+        type: "request",
+        id,
+        method: "POST",
+        path,
+        deadlineMs,
+        body: runtimeAdapterExecRelayBody(execRequest, lease.id, registrationID),
+      };
+      const result = new Promise<RuntimeAdapterRelayResult>((resolve) => {
+        const timeout = setTimeout(
+          () => {
+            sendRuntimeAdapterCancel(agent, id);
+            this.settleRuntimeAdapterPending(id, {
+              origin: "relay",
+              response: runtimeAdapterRelayError(
+                id,
+                504,
+                "runtime_adapter_timeout",
+                "runtime adapter command did not finish in time; it was stopped",
+              ),
+            });
+          },
+          Math.max(0, deadlineMs - Date.now()),
+        );
+        const abortHandler = () => {
+          this.cancelRuntimeAdapterPending(id);
+        };
+        const pending: RuntimeAdapterPendingRequest = {
+          adapterID,
+          owner: identity.owner,
+          org: identity.org,
+          dispatched: false,
+          clientSettled: false,
+          resolve,
+          timeout,
+          signal: request.signal,
+          abortHandler,
+          exec: { leaseID: lease.id, agent },
+        };
+        this.runtimeAdapterPending.set(id, pending);
+        request.signal.addEventListener("abort", abortHandler, { once: true });
+        if (request.signal.aborted) {
+          abortHandler();
+        } else {
+          pending.dispatched = true;
+          agent.send(JSON.stringify(relayRequest));
+        }
+      });
+      return { result, lease, registrationID };
+    });
+    if (admission instanceof Response) {
+      return admission;
+    }
+    const { response } = await admission.result;
+    let status = response.status;
+    let responseBody = [204, 205, 304].includes(status) ? null : (response.body ?? null);
+    if (status >= 200 && status < 300) {
+      // Release output only while the authorising lease generation is current.
+      const latest = await this.state.runExclusive(() => this.getLease(admission.lease.id));
+      const latestExpiry = Date.parse(latest?.expiresAt ?? "");
+      if (
+        !latest ||
+        latest.state !== "active" ||
+        latest.runtimeAdapterDeleteRequestedAt ||
+        latest.runtimeAdapterID !== adapterID ||
+        latest.runtimeAdapterWorkspaceID !== workspaceID ||
+        latest.runtimeAdapterRegistrationID !== admission.registrationID ||
+        !Number.isFinite(latestExpiry) ||
+        latestExpiry <= Date.now()
+      ) {
+        status = 409;
+        responseBody = JSON.stringify({
+          error: "workspace_lifecycle_changed",
+          message: "the workspace lease changed before the command result was released",
+        });
+      }
+    }
+    return new Response(responseBody, {
+      status,
+      headers: {
+        "cache-control": "no-store",
+        "content-type": "application/json; charset=utf-8",
+      },
+    });
   }
 
   private async runtimeAdapterProxyResult(
@@ -10798,6 +11099,28 @@ export class FleetCoordinator {
     pending.clientSettled = true;
     pending.signal.removeEventListener("abort", pending.abortHandler);
     pending.resolve(result);
+    // An exec keeps running on the adapter until withdrawn. The entry stays
+    // counted until the adapter answers or the deadline passes.
+    if (pending.exec) {
+      sendRuntimeAdapterCancel(pending.exec.agent, id);
+    }
+  }
+
+  /** Stops every exec relayed for a lease whose workspace is being deleted. */
+  private cancelRuntimeAdapterExecForLease(leaseID: string): void {
+    for (const [id, pending] of this.runtimeAdapterPending) {
+      if (pending.exec?.leaseID !== leaseID) continue;
+      sendRuntimeAdapterCancel(pending.exec.agent, id);
+      this.settleRuntimeAdapterPending(id, {
+        origin: "relay",
+        response: runtimeAdapterRelayError(
+          id,
+          409,
+          "workspace_lifecycle_changed",
+          "runtime adapter workspace is being deleted; the command was stopped",
+        ),
+      });
+    }
   }
 
   private clearRuntimeAdapterAgent(adapterID: string, socket: WebSocket): void {
@@ -21510,6 +21833,16 @@ function runtimeAdapterIdentityKey(adapterID: string): string {
   return `runtime-adapter-identity:${adapterID}`;
 }
 
+function sendRuntimeAdapterCancel(agent: WebSocket, id: string): void {
+  if (agent.readyState !== WebSocket.OPEN) return;
+  const frame: RuntimeAdapterRelayCancel = { type: "cancel", id };
+  try {
+    agent.send(JSON.stringify(frame));
+  } catch {
+    // A closed relay cancels every in-flight local request itself.
+  }
+}
+
 function runtimeAdapterRelayError(
   id: string,
   status: number,
@@ -24598,7 +24931,9 @@ function bridgeAttachment(value: unknown): BridgeAttachment | undefined {
         typeof attachment.org === "string" &&
         isCurrentOrgKey(attachment.org) &&
         (attachment.desktopTimeoutMs === undefined ||
-          validRuntimeAdapterDesktopRelayTimeout(attachment.desktopTimeoutMs))
+          validRuntimeAdapterDesktopRelayTimeout(attachment.desktopTimeoutMs)) &&
+        (attachment.execTimeoutMs === undefined ||
+          validRuntimeAdapterExecRelayTimeout(attachment.execTimeoutMs))
         ? attachment
         : undefined;
     case "control":
