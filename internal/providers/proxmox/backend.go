@@ -48,12 +48,36 @@ func NewLeaseBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) c
 func (b *leaseBackend) SupportsRequestedLeaseID() bool { return true }
 
 func (b *leaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	if err := validateProxmoxTemplateCapabilities(b.Cfg); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	if strings.TrimSpace(req.RequestedLeaseID) != "" {
 		return b.acquireFixed(ctx, req)
 	}
 	return shared.AcquireAttemptsRetry(b.RT, req.Keep, func() (core.LeaseTarget, error) {
 		return b.acquireOnce(ctx, req.Keep, req.RequestedSlug)
 	})
+}
+
+// Desktop and browser leases need a template that the operator prepared and
+// declared for them. Every clone still verifies the declaration before ready.
+func validateProxmoxTemplateCapabilities(cfg core.Config) error {
+	if !cfg.Desktop && !cfg.Browser {
+		return nil
+	}
+	if cfg.Desktop && !cfg.Proxmox.TemplateDesktop {
+		return core.Exit(2, "provider=proxmox desktop leases need a prepared desktop template; set proxmox.templateDesktop=true for templateId %d", cfg.Proxmox.TemplateID)
+	}
+	if cfg.Desktop && core.NormalizedDesktopEnv(cfg.DesktopEnv) != "xfce" {
+		return core.Exit(2, "provider=proxmox template desktops support desktopEnv=xfce only")
+	}
+	if cfg.Browser && !cfg.Proxmox.TemplateBrowser {
+		return core.Exit(2, "provider=proxmox browser leases need a prepared browser template; set proxmox.templateBrowser=true for templateId %d", cfg.Proxmox.TemplateID)
+	}
+	if strings.TrimSpace(cfg.SSHUser) != "crabbox" {
+		return core.Exit(2, "provider=proxmox template desktops and browsers run as user crabbox; set proxmox.user=crabbox")
+	}
+	return nil
 }
 
 func (b *leaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug string) (core.LeaseTarget, error) {

@@ -475,18 +475,20 @@ func configShowView(cfg Config) map[string]any {
 			"forgetMissing":     cfg.AWSLambdaMicroVM.ForgetMissing,
 		},
 		"proxmox": map[string]any{
-			"apiUrl":      redactedConfigURL(cfg.Proxmox.APIURL),
-			"auth":        tokenState(cfg.Proxmox.TokenSecret),
-			"tokenId":     cfg.Proxmox.TokenID,
-			"node":        cfg.Proxmox.Node,
-			"templateId":  cfg.Proxmox.TemplateID,
-			"storage":     cfg.Proxmox.Storage,
-			"pool":        cfg.Proxmox.Pool,
-			"bridge":      cfg.Proxmox.Bridge,
-			"user":        cfg.Proxmox.User,
-			"workRoot":    cfg.Proxmox.WorkRoot,
-			"fullClone":   cfg.Proxmox.FullClone,
-			"insecureTLS": cfg.Proxmox.InsecureTLS,
+			"apiUrl":          redactedConfigURL(cfg.Proxmox.APIURL),
+			"auth":            tokenState(cfg.Proxmox.TokenSecret),
+			"tokenId":         cfg.Proxmox.TokenID,
+			"node":            cfg.Proxmox.Node,
+			"templateId":      cfg.Proxmox.TemplateID,
+			"storage":         cfg.Proxmox.Storage,
+			"pool":            cfg.Proxmox.Pool,
+			"bridge":          cfg.Proxmox.Bridge,
+			"user":            cfg.Proxmox.User,
+			"workRoot":        cfg.Proxmox.WorkRoot,
+			"fullClone":       cfg.Proxmox.FullClone,
+			"insecureTLS":     cfg.Proxmox.InsecureTLS,
+			"templateDesktop": cfg.Proxmox.TemplateDesktop,
+			"templateBrowser": cfg.Proxmox.TemplateBrowser,
 		},
 		"incus": map[string]any{
 			"remote":            cfg.Incus.Remote,
@@ -653,7 +655,7 @@ func writeConfigShowText(w io.Writer, cfg Config) error {
 	if err := layout.writeSlot(w, "gcp"); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "proxmox api_url=%s node=%s template_id=%d storage=%s pool=%s bridge=%s user=%s work_root=%s full_clone=%t auth=%s\n", blank(redactedConfigURL(cfg.Proxmox.APIURL), "-"), blank(cfg.Proxmox.Node, "-"), cfg.Proxmox.TemplateID, blank(cfg.Proxmox.Storage, "-"), blank(cfg.Proxmox.Pool, "-"), blank(cfg.Proxmox.Bridge, "-"), cfg.Proxmox.User, cfg.Proxmox.WorkRoot, cfg.Proxmox.FullClone, tokenState(cfg.Proxmox.TokenSecret))
+	fmt.Fprintf(w, "proxmox api_url=%s node=%s template_id=%d storage=%s pool=%s bridge=%s user=%s work_root=%s full_clone=%t template_desktop=%t template_browser=%t auth=%s\n", blank(redactedConfigURL(cfg.Proxmox.APIURL), "-"), blank(cfg.Proxmox.Node, "-"), cfg.Proxmox.TemplateID, blank(cfg.Proxmox.Storage, "-"), blank(cfg.Proxmox.Pool, "-"), blank(cfg.Proxmox.Bridge, "-"), cfg.Proxmox.User, cfg.Proxmox.WorkRoot, cfg.Proxmox.FullClone, cfg.Proxmox.TemplateDesktop, cfg.Proxmox.TemplateBrowser, tokenState(cfg.Proxmox.TokenSecret))
 	if err := layout.writeSlot(w, "firecracker"); err != nil {
 		return err
 	}

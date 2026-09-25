@@ -16,7 +16,9 @@ then drives the normal SSH sync/run/release path.
 The provider is direct-only: it talks to the Proxmox API straight from the CLI.
 The Crabbox coordinator (broker) does not provision or broker Proxmox capacity,
 so brokered shared-team leases are not available here. Proxmox supports the
-`ssh`, `crabbox-sync`, and `cleanup` features on `target=linux` only. Direct
+`ssh`, `crabbox-sync`, and `cleanup` features on `target=linux` only. `desktop`
+and `browser` leases also need a template prepared and declared for them; see
+[Desktop and browser templates](#desktop-and-browser-templates). Direct
 Proxmox also supports caller-supplied fixed lease IDs with
 `warmup --lease-id cbx_<12 lowercase hex>`.
 
@@ -186,6 +188,8 @@ proxmox:
   workRoot: /work/crabbox
   fullClone: true
   insecureTLS: false
+  templateDesktop: false
+  templateBrowser: false
 ```
 
 `apiUrl`, `tokenId`, `tokenSecret`, `node`, and `templateId` are required for
@@ -213,6 +217,8 @@ CRABBOX_PROXMOX_USER
 CRABBOX_PROXMOX_WORK_ROOT
 CRABBOX_PROXMOX_FULL_CLONE
 CRABBOX_PROXMOX_INSECURE_TLS
+CRABBOX_PROXMOX_TEMPLATE_DESKTOP
+CRABBOX_PROXMOX_TEMPLATE_BROWSER
 ```
 
 Provider flags mirror the non-secret config fields:
@@ -232,7 +238,65 @@ Provider flags mirror the non-secret config fields:
 
 There is intentionally no `--proxmox-token-secret` flag, so the token secret
 never appears in shell history or process arguments. Supply it through
-`CRABBOX_PROXMOX_TOKEN_SECRET` or the config file instead.
+`CRABBOX_PROXMOX_TOKEN_SECRET` or the config file instead. `templateDesktop`
+and `templateBrowser` describe the operator's template, so they have no flags.
+
+## Desktop and browser templates
+
+Proxmox does not install a desktop or browser while it acquires a lease. The
+template supplies the packages, and you declare that in configuration:
+
+- `templateDesktop: true` allows `--desktop` with the default XFCE desktop
+- `templateBrowser: true` allows `--browser`
+
+Without the declaration, `--desktop` and `--browser` fail before any Proxmox API
+call. Wayland and GNOME desktops and `--code` are not supported. The guest user
+must be `crabbox`, because the managed desktop services run as that user.
+
+A desktop template needs the managed Linux XFCE packages:
+
+```text
+tigervnc-standalone-server tigervnc-tools xfce4-session xfwm4 xfce4-panel
+xfdesktop4 xfce4-terminal xfconf xfce4-settings xauth dbus-x11
+x11-xserver-utils xterm scrot ffmpeg xdotool wmctrl xclip xsel
+fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme util-linux
+novnc websockify
+```
+
+A template prepared with
+[`scripts/install-linux-desktop.sh`](../../scripts/install-linux-desktop.sh)
+already has these packages and compatible services. Crabbox still rewrites the
+services and replaces the VNC password in every clone.
+
+A browser template needs `gnupg`, `build-essential` and `python3`, plus a
+working `google-chrome-stable`, `chromium` or `chromium-browser` package. On
+Ubuntu 24.04, `chromium-browser` is a transitional package for a snap, which
+`virt-customize` cannot install. Use Google Chrome from Google's signed
+repository or another working Chromium package instead. For example, add the
+packages with `virt-customize --install` before converting the image into a
+template. Do not leave a VNC password, browser profile or other
+credential in the template.
+
+For each clone, the bootstrap:
+
+1. Checks that every required package is installed. It fails instead of
+   installing a missing package.
+2. Writes the same XFCE services and scripts that managed Linux leases use.
+3. Replaces any VNC password with a new random password for this clone.
+4. Starts the TigerVNC display and XFCE session. VNC listens on guest loopback
+   only, and you reach it through SSH with `crabbox vnc` or WebVNC. Crabbox never
+   uses the Proxmox console.
+5. Writes the managed browser wrapper and removes any browser profile copied
+   from the template.
+
+`crabbox-ready` then also checks that the desktop services are active, the VNC
+password exists, port 5900 listens only on `127.0.0.1` or `[::1]`, and the
+browser wrapper runs. The lease is not ready until these checks pass, and later
+readiness probes run them again.
+
+The requested capabilities are stored in the VM description and are part of a
+fixed lease's create intent. Replaying a fixed lease ID with different
+capabilities returns `lease_id_conflict` without cloning another VM.
 
 ## Readiness and token permissions
 
