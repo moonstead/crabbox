@@ -17,6 +17,10 @@ type ProxmoxConfig struct {
 	WorkRoot    string `config:"workRoot" env:"CRABBOX_PROXMOX_WORK_ROOT" flag:"proxmox-work-root" sources:"user,repo,env,flag" help:"remote work root for Proxmox VMs" fileIgnoreEmpty:"true" fileStorage:"value" reportApplied:"true"`
 	FullClone   bool   `config:"fullClone" env:"CRABBOX_PROXMOX_FULL_CLONE" flag:"proxmox-full-clone" sources:"user,repo,env,flag" help:"create full Proxmox clones" default:"true"`
 	InsecureTLS bool   `config:"insecureTLS" env:"CRABBOX_PROXMOX_INSECURE_TLS" flag:"proxmox-insecure-tls" sources:"user,repo,env,flag" help:"allow self-signed Proxmox TLS certificates" reportApplied:"true"`
+	// Template capabilities are operator facts about templateId. Acquisition
+	// still verifies them in every clone before the lease becomes ready.
+	TemplateDesktop bool `config:"templateDesktop" env:"CRABBOX_PROXMOX_TEMPLATE_DESKTOP" sources:"user,repo,env"`
+	TemplateBrowser bool `config:"templateBrowser" env:"CRABBOX_PROXMOX_TEMPLATE_BROWSER" sources:"user,repo,env"`
 }
 
 const ProxmoxConfigDefaultWorkRoot string = defaultPOSIXWorkRoot

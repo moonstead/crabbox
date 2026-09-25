@@ -7,18 +7,20 @@ import (
 )
 
 type fileProxmoxConfig struct {
-	APIURL      string `yaml:"apiUrl,omitempty"`
-	TokenID     string `yaml:"tokenId,omitempty"`
-	TokenSecret string `yaml:"tokenSecret,omitempty"`
-	Node        string `yaml:"node,omitempty"`
-	TemplateID  int    `yaml:"templateId,omitempty"`
-	Storage     string `yaml:"storage,omitempty"`
-	Pool        string `yaml:"pool,omitempty"`
-	Bridge      string `yaml:"bridge,omitempty"`
-	User        string `yaml:"user,omitempty"`
-	WorkRoot    string `yaml:"workRoot,omitempty"`
-	FullClone   *bool  `yaml:"fullClone,omitempty"`
-	InsecureTLS *bool  `yaml:"insecureTLS,omitempty"`
+	APIURL          string `yaml:"apiUrl,omitempty"`
+	TokenID         string `yaml:"tokenId,omitempty"`
+	TokenSecret     string `yaml:"tokenSecret,omitempty"`
+	Node            string `yaml:"node,omitempty"`
+	TemplateID      int    `yaml:"templateId,omitempty"`
+	Storage         string `yaml:"storage,omitempty"`
+	Pool            string `yaml:"pool,omitempty"`
+	Bridge          string `yaml:"bridge,omitempty"`
+	User            string `yaml:"user,omitempty"`
+	WorkRoot        string `yaml:"workRoot,omitempty"`
+	FullClone       *bool  `yaml:"fullClone,omitempty"`
+	InsecureTLS     *bool  `yaml:"insecureTLS,omitempty"`
+	TemplateDesktop *bool  `yaml:"templateDesktop,omitempty"`
+	TemplateBrowser *bool  `yaml:"templateBrowser,omitempty"`
 }
 
 const ProxmoxConfigDefaultUser string = "crabbox"
@@ -50,7 +52,7 @@ func (cfg *ProxmoxConfig) applyFile(file *fileProxmoxConfig) (ProxmoxConfigAppli
 
 func (cfg *ProxmoxConfig) applyEnv() (ProxmoxConfigApplied, error) {
 	var applied ProxmoxConfigApplied
-	err := applyConfigEnvironment(cfg, &applied, 0, 12)
+	err := applyConfigEnvironment(cfg, &applied, 0, 14)
 	return applied, err
 }
 

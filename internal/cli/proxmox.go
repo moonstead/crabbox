@@ -12,11 +12,14 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type ProxmoxClient struct {
@@ -1561,6 +1564,16 @@ func sortedLabelKeys(labels map[string]string) []string {
 }
 
 func proxmoxBootstrapScript(cfg Config) string {
+	capabilities := proxmoxTemplateCapabilityBootstrap(cfg)
+	ready := "/usr/local/bin/crabbox-ready"
+	if capabilities != "" {
+		// Template desktop services may need a moment after their restart.
+		ready = `for _ in $(seq 1 30); do
+  /usr/local/bin/crabbox-ready >/dev/null 2>&1 && break
+  sleep 2
+done
+/usr/local/bin/crabbox-ready`
+	}
 	return fmt.Sprintf(`set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p %[1]s /var/cache/crabbox/pnpm /var/cache/crabbox/npm /var/lib/crabbox
@@ -1590,11 +1603,136 @@ rsync --version >/dev/null
 curl --version >/dev/null
 jq --version >/dev/null
 test -w %[1]s
-READY
+%[3]sREADY
 chmod 0755 /usr/local/bin/crabbox-ready
 systemctl enable ssh || true
 systemctl restart ssh || systemctl restart ssh.socket || true
-touch /var/lib/crabbox/bootstrapped
-/usr/local/bin/crabbox-ready
-`, shellQuote(cfg.WorkRoot), shellQuote(cfg.SSHUser))
+%[4]stouch /var/lib/crabbox/bootstrapped
+%[5]s
+`, shellQuote(cfg.WorkRoot), shellQuote(cfg.SSHUser), proxmoxTemplateCapabilityReadyChecks(cfg), capabilities, ready)
 }
+
+// proxmoxTemplateCapabilityBootstrap configures the desktop and browser that a
+// prepared template provides. The template owns every package: this never
+// installs one. Crabbox writes the managed Linux desktop units, gives each
+// clone its own VNC password and removes browser state copied from the template.
+func proxmoxTemplateCapabilityBootstrap(cfg Config) string {
+	if !cfg.Desktop && !cfg.Browser {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(sharedLinuxOptionalPackages())
+	b.WriteString(`
+crabbox_require_template_packages() {
+  crabbox_packages_installed "$@" && return 0
+  echo "proxmox template is missing required packages: $*" >&2
+  return 1
+}
+install -d -m 0750 -o crabbox -g crabbox /var/lib/crabbox
+`)
+	if cfg.Desktop {
+		b.WriteString("crabbox_require_template_packages " + linuxXFCEDesktopPackages + "\n")
+		files, err := proxmoxManagedDesktopFiles(cfg)
+		if err != nil {
+			b.WriteString("echo " + shellQuote("managed desktop files are unavailable: "+err.Error()) + " >&2\nexit 1\n")
+			return b.String()
+		}
+		for _, file := range files {
+			fmt.Fprintf(&b, "mkdir -p %s\ncat >%s <<'CRABBOX_TEMPLATE_FILE'\n%sCRABBOX_TEMPLATE_FILE\nchmod %s %s\n",
+				shellQuote(path.Dir(file.Path)), shellQuote(file.Path), file.Content, file.Permissions, shellQuote(file.Path))
+		}
+		b.WriteString(`systemctl stop crabbox-desktop.service crabbox-xvfb.service 2>/dev/null || true
+# A password baked into the template would be shared by every clone.
+rm -f /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
+(umask 077 && openssl rand -base64 18 > /var/lib/crabbox/vnc.password)
+head -c 8 /var/lib/crabbox/vnc.password | tigervncpasswd -f > /var/lib/crabbox/vnc.pass
+chown crabbox:crabbox /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
+chmod 0600 /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
+printf 'CRABBOX_DESKTOP_ENV=xfce\nDISPLAY=:99\n' >/var/lib/crabbox/desktop.env
+chown crabbox:crabbox /var/lib/crabbox/desktop.env
+chmod 0644 /var/lib/crabbox/desktop.env
+systemctl disable --now crabbox-desktop-session.service 2>/dev/null || true
+rm -f /etc/systemd/system/crabbox-desktop-session.service
+env -u DISPLAY CRABBOX_DESKTOP_USER=crabbox /usr/local/bin/crabbox-configure-desktop-theme
+systemctl daemon-reload
+systemctl disable --now crabbox-wayvnc.service crabbox-x11vnc.service 2>/dev/null || true
+systemctl enable crabbox-xvfb.service crabbox-desktop.service
+systemctl restart crabbox-xvfb.service crabbox-desktop.service
+`)
+	}
+	if cfg.Browser {
+		b.WriteString("crabbox_require_template_packages " + linuxBrowserSupportPackages + "\n")
+		b.WriteString(`browser_path="$(crabbox_existing_browser || true)"
+if [ -z "$browser_path" ]; then
+  echo "proxmox template has no working Google Chrome or Chromium package" >&2
+  exit 1
+fi
+# A browser profile baked into the template would be shared by every clone.
+rm -rf /home/crabbox/.cache/crabbox/browser-profile
+`)
+		b.WriteString(linuxBrowserWrapperScript + "\n")
+	}
+	return b.String()
+}
+
+type proxmoxTemplateFile struct {
+	Path        string `yaml:"path"`
+	Permissions string `yaml:"permissions"`
+	Content     string `yaml:"content"`
+}
+
+// proxmoxManagedDesktopFiles reuses the managed Linux XFCE files verbatim so
+// template and cloud-init desktops run the same services.
+func proxmoxManagedDesktopFiles(cfg Config) ([]proxmoxTemplateFile, error) {
+	cfg.Provider, cfg.Desktop, cfg.DesktopEnv = "proxmox", true, desktopEnvXFCE
+	var document struct {
+		WriteFiles []proxmoxTemplateFile `yaml:"write_files"`
+	}
+	if err := yaml.Unmarshal([]byte("write_files:\n"+cloudInitOptionalWriteFiles(cfg)), &document); err != nil {
+		return nil, err
+	}
+	if len(document.WriteFiles) == 0 {
+		return nil, fmt.Errorf("no managed desktop files")
+	}
+	for i, file := range document.WriteFiles {
+		if !path.IsAbs(file.Path) || path.Clean(file.Path) != file.Path || !proxmoxFileModePattern.MatchString(file.Permissions) || file.Content == "" {
+			return nil, fmt.Errorf("invalid managed desktop file %q", file.Path)
+		}
+		if !strings.HasSuffix(file.Content, "\n") {
+			document.WriteFiles[i].Content += "\n"
+		}
+		if strings.Contains("\n"+document.WriteFiles[i].Content, "\nCRABBOX_TEMPLATE_FILE\n") {
+			return nil, fmt.Errorf("managed desktop file %q contains its heredoc delimiter", file.Path)
+		}
+	}
+	return document.WriteFiles, nil
+}
+
+var proxmoxFileModePattern = regexp.MustCompile(`^0[0-7]{3}$`)
+
+// proxmoxTemplateCapabilityReadyChecks run as the lease user in every later
+// readiness probe. VNC must listen on loopback only.
+func proxmoxTemplateCapabilityReadyChecks(cfg Config) string {
+	var b strings.Builder
+	if cfg.Desktop {
+		b.WriteString(`systemctl is-active --quiet crabbox-xvfb.service
+systemctl is-active --quiet crabbox-desktop.service
+test -s /var/lib/crabbox/vnc.password
+` + proxmoxVNCLoopbackCheck + "\n")
+	}
+	if cfg.Browser {
+		b.WriteString(`test -s /var/lib/crabbox/browser.env
+. /var/lib/crabbox/browser.env
+test -x "$BROWSER"
+"$BROWSER" --version >/dev/null
+`)
+	}
+	return b.String()
+}
+
+const proxmoxVNCLoopbackCheck = `vnc_listeners="$(ss -Hltn | awk '$4 ~ /:5900$/ { print $4 }')"
+printf '%s\n' "$vnc_listeners" | grep -qx '127\.0\.0\.1:5900'
+if printf '%s\n' "$vnc_listeners" | grep -Evxq '127\.0\.0\.1:5900|\[::1\]:5900'; then
+  echo "VNC listens outside loopback" >&2
+  exit 1
+fi`
