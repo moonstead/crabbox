@@ -64,6 +64,7 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 		return core.LeaseTarget{}, err
 	}
 	var publicKey, fingerprint string
+	var unready core.LeaseTarget
 	acquired, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
 		Kind: fixedProxmoxLeaseKind, LeaseID: leaseID, CheckpointID: req.RequestedCheckpointID,
 		RepoRoot: req.Repo.Root, Reclaim: req.Reclaim, TargetOS: cfg.TargetOS,
@@ -112,6 +113,11 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 				return result, err
 			}
 			if claim.CloudImmutableID == "" || server.Labels["state"] != "ready" {
+				// Replay never resumes bootstrap. A bound generation still proves
+				// which VM this attempt cloned, so report it for checked stop.
+				if claim.CloudImmutableID != "" && validateFixedProxmoxServer(server, *claim, vmid, node) == nil {
+					unready = core.LeaseTarget{Server: server, LeaseID: leaseID}
+				}
 				return result, core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has an unresolved generation or readiness binding; inspect and release the attempt", leaseID)
 			}
 			if err := validateFixedProxmoxServer(server, *claim, vmid, node); err != nil {
@@ -193,6 +199,13 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 		}
 		return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 	}})
+	// Outside the claim fence, as for a completed acquisition. The replay
+	// still fails and the claim is unchanged.
+	if err != nil && unready.LeaseID != "" && req.OnAcquired != nil {
+		if ackErr := req.OnAcquired(unready); ackErr != nil {
+			err = errors.Join(err, fmt.Errorf("report unready fixed Proxmox VM identity: %w", ackErr))
+		}
+	}
 	return core.CompleteFixedAcquisition(acquired, err, req)
 }
 
