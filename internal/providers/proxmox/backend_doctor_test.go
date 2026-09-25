@@ -37,6 +37,7 @@ type fakeProxmoxDoctorClient struct {
 	getServerByID         map[string]core.Server
 	clusterExistsByID     map[string]bool
 	clusterExistsErr      error
+	activeCloneErr        error
 	setLabels             []map[string]string
 	labelNodes            []string
 	readiness             []core.ProxmoxReadinessCheck
@@ -50,6 +51,19 @@ func (c *fakeProxmoxDoctorClient) DoctorReadiness(context.Context, core.Config) 
 func (c *fakeProxmoxDoctorClient) ListCrabboxServers(context.Context) ([]core.Server, error) {
 	c.listCalls++
 	return c.servers, c.listErr
+}
+
+func (c *fakeProxmoxDoctorClient) VMIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
+	for _, server := range c.servers {
+		if server.Name == name {
+			return true, nil
+		}
+	}
+	return c.VMExistsInCluster(ctx, id)
+}
+
+func (c *fakeProxmoxDoctorClient) VerifyNoActiveCloneTasks(context.Context) error {
+	return c.activeCloneErr
 }
 
 func (c *fakeProxmoxDoctorClient) ListCrabboxServersCluster(context.Context) ([]core.Server, error) {
