@@ -320,6 +320,14 @@ name is absent from complete org-scoped inventory across a 30-second grace
 period. A matching name or any uncertain read retains the claim; recovery never
 adopts or deletes a machine by name. See [Boxd recovery](../providers/boxd.md#lifecycle-and-recovery).
 
+For a Proxmox fixed-ID claim left `prepared` by an unresolved clone, including
+claims written by v0.66.0 and earlier, `stop --force --provider proxmox --id
+<canonical-cbx-id>` writes the terminal tombstone only after complete cluster
+inventory and the audited VMID lookup show neither the VMID nor a lease VM for 5
+minutes under the claim lock. Any presence, failed read or cancellation retains
+the claim. It never adopts or deletes a VM, and refuses bound, acquired or
+otherwise owned claims. See [Proxmox recovery](../providers/proxmox.md#recovering-an-unresolved-fixed-id-clone-attempt).
+
 `--reclaim` remains the existing provider-specific adoption interface where
 supported. `--force` is the consistent cross-provider recovery interface for
 one exact resource: it reuses verified adoption for supported direct providers

@@ -470,7 +470,9 @@ authorization bypass. It requires an explicit provider and exact resource ID.
 Adapters that support safe adoption must first inspect provider identity and
 scope, create a conflict-safe exact claim, and retain that claim through the
 normal fenced operation. Brokered recovery instead requires a successful fresh
-inspection of the exact coordinator lease and its provider. Unsupported
+inspection of the exact coordinator lease and its provider. Proxmox fixed-ID
+recovery adopts nothing: it settles only an unbound prepared claim after
+repeated authoritative cluster absence across a grace period. Unsupported
 providers, ambiguous identifiers, and failed ownership inspections fail closed;
 there is no force-enabled cleanup sweep.
 

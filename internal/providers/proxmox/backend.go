@@ -218,6 +218,12 @@ func (b *leaseBackend) releaseTargetFromClaim(ctx context.Context, client proxmo
 	if !ok || claim.LeaseID == "" || !core.LeaseClaimMatchesIdentifier(claim, id) {
 		return core.LeaseTarget{}, core.Exit(4, "lease/server not found: %s", id)
 	}
+	// A fixed tombstone may have no VMID, or one another lease now uses.
+	if fixedProxmoxLeaseKind.IsFixedClaim(claim) {
+		if target, terminal, err := fixedProxmoxLeaseKind.ResolveTerminal(claim, true); terminal {
+			return target, err
+		}
+	}
 	cloudID := strings.TrimSpace(claim.CloudID)
 	vmid, err := strconv.ParseInt(cloudID, 10, 64)
 	if err != nil || vmid <= 0 {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"reflect"
 	"time"
 )
@@ -515,6 +516,86 @@ func (tx *FixedTransaction) RejectAttempt(kind FixedLeaseKind, token string, ter
 	}
 	tx.FailedAttemptSet()[token] = true
 	return nil
+}
+
+// SettleUnresolvedFixedAttempt is an explicit operator recovery for a prepared
+// fixed claim whose native outcome is unknown. Under the claim fence, prove must
+// show that no resource exists and that none can still appear. Core never infers
+// either from the claim and never reuses an earlier proof. A bound generation,
+// failed attempts, a checkpoint, or a coordinator or runtime-adapter owner is
+// refused. An already terminal claim is an idempotent success. The result
+// reports whether this call wrote the terminal tombstone.
+func SettleUnresolvedFixedAttempt(ctx context.Context, kind FixedLeaseKind, expected LeaseClaim, prove func(context.Context, LeaseClaim) error) (bool, error) {
+	if !kind.IsFixedClaim(expected) || expected.FixedCreateIntent.Version != kind.IntentVersion || prove == nil {
+		return false, Exit(4, "lease_id_conflict: fixed recovery has no matching ownership dialect")
+	}
+	settled := false
+	err := WithDurableLeaseClaimLockContext(ctx, expected.LeaseID, func(claim *LeaseClaim, exists bool, persist func() error) error {
+		if !exists {
+			return Exit(4, "lease_id_conflict: fixed %s lease %s has no local claim", kind.Label, expected.LeaseID)
+		}
+		if kind.IsFixedClaim(*claim) && claim.FixedCreateIntent.State == "released" {
+			return kind.ValidateTerminalClaim(*claim, expected, expected.LeaseID, nil)
+		}
+		if !reflect.DeepEqual(*claim, expected) {
+			return Exit(4, "lease_id_conflict: fixed claim changed before recovery; retry")
+		}
+		intent := claim.FixedCreateIntent
+		if intent.State != "prepared" || claim.CloudImmutableID != "" || len(intent.FailedAttempts) != 0 || intent.CheckpointID != "" || claim.CheckpointCapture != nil ||
+			claim.CoordinatorRegistrationURL != "" || claim.RuntimeAdapterRegistrationID != "" || claim.RuntimeAdapterPendingRegistrationID != "" {
+			return Exit(4, "lease_id_conflict: fixed %s lease %s is not an unbound prepared attempt without another owner", kind.Label, claim.LeaseID)
+		}
+		if err := validateFixedJournal(intent); err != nil {
+			return err
+		}
+		if err := prove(ctx, CloneLeaseClaim(*claim)); err != nil {
+			return err
+		}
+		// Cancellation after a completed proof still retains custody.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		*claim = kind.TerminalClaim(*claim, time.Now().UTC())
+		if err := persist(); err != nil {
+			return err
+		}
+		settled = true
+		return nil
+	})
+	return settled, err
+}
+
+// WriteFixedRecoveryEvidence durably records one explicit recovery attempt in
+// the state directory. It is audit history only: recovery never reads it back
+// as authority, so every settlement follows its own fresh proof.
+func WriteFixedRecoveryEvidence(leaseID string, at time.Time, record any) (string, error) {
+	if !IsCanonicalLeaseID(leaseID) {
+		return "", Exit(2, "fixed recovery evidence requires a canonical lease ID")
+	}
+	stateDir, err := CrabboxStateDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(stateDir, "fixed-recovery", leaseID)
+	firstExisting, err := nearestExistingClaimDirectory(dir)
+	if err != nil {
+		return "", err
+	}
+	if err := makePrivateClaimDirectories(dir); err != nil {
+		return "", Exit(2, "create fixed recovery evidence directory: %v", err)
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, at.UTC().Format("20060102T150405.000000000Z")+".json")
+	if err := writeStateFileAtomic(path, append(data, '\n'), syncControllerDirectory); err != nil {
+		return "", Exit(2, "write fixed recovery evidence %s: %v", path, err)
+	}
+	if err := syncCreatedClaimDirectoryParentsWithSync(dir, firstExisting, syncControllerDirectory); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func finalizeFixedLeaseWithArtifacts(kind FixedLeaseKind, expected, terminal LeaseClaim, deleteExact func() error) error {

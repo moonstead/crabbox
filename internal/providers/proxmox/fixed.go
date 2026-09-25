@@ -333,15 +333,19 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRe
 
 // verifyFixedProxmoxAbsence requires complete cluster inventory and an audited
 // VMID lookup. It never infers absence from one node or one missing list row.
+// VMID 0 means no clone was ever submitted, so only lease identity is checked.
 func verifyFixedProxmoxAbsence(ctx context.Context, client proxmoxClient, leaseID string, vmid int) error {
 	remaining, err := client.ListCrabboxServersCluster(ctx)
 	if err != nil {
 		return fmt.Errorf("verify fixed Proxmox inventory: %w", err)
 	}
 	for _, candidate := range remaining {
-		if candidate.CloudID == strconv.Itoa(vmid) || candidate.Labels["lease"] == leaseID {
+		if (vmid != 0 && candidate.CloudID == strconv.Itoa(vmid)) || candidate.Labels["lease"] == leaseID || candidate.Labels["provider_key"] == core.ProviderKeyForLease(leaseID) {
 			return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s still has a surviving VM", leaseID)
 		}
+	}
+	if vmid == 0 {
+		return nil
 	}
 	present, err := client.VMExistsInCluster(ctx, strconv.Itoa(vmid))
 	if err != nil {
@@ -370,6 +374,10 @@ func rejectFixedProxmoxClone(ctx context.Context, client proxmoxClient, tx *core
 }
 
 func validateFixedProxmoxTerminalClaim(claim core.LeaseClaim) error {
+	// A recovered claim that never reserved a VMID has no VM identity to retain.
+	if claim.CloudID == "" && claim.CloudNumericID == 0 && claim.CloudImmutableID == "" && len(claim.Labels) == 0 {
+		return nil
+	}
 	if claim.CloudID == "" || claim.CloudID != strconv.FormatInt(claim.CloudNumericID, 10) ||
 		claim.Labels["lease"] != claim.LeaseID || claim.Labels["provider"] != "proxmox" ||
 		claim.Labels["fixed_intent_sha256"] != claim.FixedCreateIntent.Fingerprint {

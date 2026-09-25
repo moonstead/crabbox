@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFixedEngineReadsLegacyProviderRecords(t *testing.T) {
@@ -322,5 +323,130 @@ func TestFixedEngineRejectRequiresUnboundSubmission(t *testing.T) {
 				t.Fatalf("published attempt was not retained: %+v", claim)
 			}
 		})
+	}
+}
+
+// prepareUnresolvedFixedAttempt leaves a planned, submitted attempt whose
+// native outcome is unknown, as a lost clone reply would.
+func prepareUnresolvedFixedAttempt(t *testing.T, kind FixedLeaseKind, leaseID string, bind bool) LeaseClaim {
+	t.Helper()
+	ops := FixedLeaseOperations[string]{Admission: &FixedAdmission{FreshOnly: true},
+		DescribeIntent: func(context.Context, *LeaseClaim, bool) (FixedLeaseBinding, error) {
+			return FixedLeaseBinding{ProviderScope: "scope", Fingerprint: "hash", Slug: "fixture"}, nil
+		},
+		Plan: func(context.Context, LeaseClaim) (FixedAttemptPlan, error) {
+			return FixedAttemptPlan{Values: map[string]string{"id": "7"}, Labels: map[string]string{"lease": leaseID}, Identity: FixedResourceBinding{CloudID: "7", NumericID: 7}}, nil
+		},
+		ObserveExact: func(context.Context, *FixedTransaction, FixedObserveMode) (FixedObservation[string], error) {
+			return FixedObservation[string]{CanSubmit: true}, nil
+		},
+		Submit: func(_ context.Context, tx *FixedTransaction) (string, error) {
+			if bind {
+				if err := tx.Bind(FixedResourceBinding{ImmutableID: "generation"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return "", errors.New("lost reply")
+		},
+		PrepareAccess: func(context.Context, *FixedTransaction, string) (LeaseTarget, error) {
+			return LeaseTarget{}, errors.New("unexpected access")
+		},
+	}
+	if _, err := AcquireFixedResource(t.Context(), FixedAcquireOptions{Kind: kind, LeaseID: leaseID, RepoRoot: "/fixture"}, ops); err == nil {
+		t.Fatal("expected an unresolved attempt")
+	}
+	claim, err := ReadLeaseClaim(leaseID)
+	if err != nil || claim.FixedCreateIntent.State != "prepared" {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	return claim
+}
+
+func TestSettleUnresolvedFixedAttemptRequiresFreshFencedProof(t *testing.T) {
+	isolateTestUserDirs(t)
+	kind := FixedLeaseKind{ClaimProvider: "fixture-fixed", IntentVersion: 1, Label: "fixture", TerminalIdentityLabels: []string{"lease"}}
+	const leaseID = "cbx_abcdef123431"
+	claim := prepareUnresolvedFixedAttempt(t, kind, leaseID, false)
+	proofs := 0
+	absent := func(context.Context, LeaseClaim) error { proofs++; return nil }
+
+	stale := CloneLeaseClaim(claim)
+	stale.LastUsedAt = "2000-01-01T00:00:00Z"
+	if _, err := SettleUnresolvedFixedAttempt(t.Context(), kind, stale, absent); err == nil || !strings.Contains(err.Error(), "changed before recovery") || proofs != 0 {
+		t.Fatalf("stale claim settled: %v proofs=%d", err, proofs)
+	}
+	if _, err := SettleUnresolvedFixedAttempt(t.Context(), kind, claim, func(_ context.Context, fenced LeaseClaim) error {
+		if !reflect.DeepEqual(fenced, claim) {
+			t.Fatal("proof did not receive the fenced claim")
+		}
+		return errors.New("VMID still exists")
+	}); err == nil || !strings.Contains(err.Error(), "still exists") {
+		t.Fatalf("failed proof settled: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	if _, err := SettleUnresolvedFixedAttempt(ctx, kind, claim, func(context.Context, LeaseClaim) error { cancel(); return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled settlement: %v", err)
+	}
+	if current, _ := ReadLeaseClaim(leaseID); !reflect.DeepEqual(current, claim) {
+		t.Fatal("unsettled recovery changed the claim")
+	}
+
+	settled, err := SettleUnresolvedFixedAttempt(t.Context(), kind, claim, absent)
+	if err != nil || !settled || proofs != 1 {
+		t.Fatalf("settled=%t err=%v proofs=%d", settled, err, proofs)
+	}
+	terminal, _ := ReadLeaseClaim(leaseID)
+	if err := kind.ValidateTerminalClaim(terminal, claim, leaseID, nil); err != nil || terminal.CloudID != "7" || len(terminal.FixedCreateIntent.Attempt) != 0 {
+		t.Fatalf("terminal=%+v err=%v", terminal, err)
+	}
+	// Replay with the pre-settlement snapshot is idempotent and proves nothing.
+	if settled, err := SettleUnresolvedFixedAttempt(t.Context(), kind, claim, absent); err != nil || settled || proofs != 1 {
+		t.Fatalf("replay settled=%t err=%v proofs=%d", settled, err, proofs)
+	}
+	if after, _ := ReadLeaseClaim(leaseID); !reflect.DeepEqual(after, terminal) {
+		t.Fatal("replay changed the tombstone")
+	}
+
+	for name, mutate := range map[string]func(*LeaseClaim){
+		"bound generation": nil,
+		"runtime adapter":  func(c *LeaseClaim) { c.RuntimeAdapterPendingRegistrationID = "pending" },
+		"coordinator":      func(c *LeaseClaim) { c.CoordinatorRegistrationURL = "https://coordinator.example.test/v1/leases/x" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			id := "cbx_abcdef1234" + map[string]string{"bound generation": "32", "runtime adapter": "33", "coordinator": "34"}[name]
+			owned := prepareUnresolvedFixedAttempt(t, kind, id, mutate == nil)
+			if mutate != nil {
+				if err := WithDurableLeaseClaimLock(id, func(c *LeaseClaim, _ bool, persist func() error) error { mutate(c); return persist() }); err != nil {
+					t.Fatal(err)
+				}
+				owned, _ = ReadLeaseClaim(id)
+			}
+			if _, err := SettleUnresolvedFixedAttempt(t.Context(), kind, owned, absent); err == nil || !strings.Contains(err.Error(), "without another owner") || proofs != 1 {
+				t.Fatalf("owned attempt settled: %v proofs=%d", err, proofs)
+			}
+		})
+	}
+}
+
+func TestWriteFixedRecoveryEvidenceIsPrivateAuditHistory(t *testing.T) {
+	isolateTestUserDirs(t)
+	at := time.Date(2026, 9, 25, 12, 47, 27, 691140701, time.UTC)
+	path, err := WriteFixedRecoveryEvidence("cbx_abcdef123441", at, map[string]string{"outcome": "proven"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(path) != "20260925T124727.691140701Z.json" || filepath.Base(filepath.Dir(path)) != "cbx_abcdef123441" {
+		t.Fatalf("path=%s", path)
+	}
+	for target, mode := range map[string]os.FileMode{path: 0o600, filepath.Dir(path): 0o700} {
+		if info, err := os.Stat(target); err != nil || info.Mode().Perm() != mode {
+			t.Fatalf("%s mode=%v err=%v", target, info.Mode(), err)
+		}
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), `"outcome": "proven"`) {
+		t.Fatalf("evidence=%s", data)
+	}
+	if _, err := WriteFixedRecoveryEvidence("../cbx_abcdef123441", at, nil); err == nil {
+		t.Fatal("non-canonical lease ID accepted")
 	}
 }

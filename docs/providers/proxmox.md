@@ -408,7 +408,8 @@ permission and retry with a new lease ID. The tombstone no longer reserves the
 VMID, so later leases can use it. Any other clone failure, including transport
 errors, other HTTP statuses, task failures, and a rejection whose absence check
 fails, retains the prepared attempt as before. Attempts retained by earlier
-releases carry no rejection evidence and remain retained.
+releases carry no rejection evidence. Neither kind is settled automatically; see
+[explicit recovery](#recovering-an-unresolved-fixed-id-clone-attempt).
 
 Successful fixed-ID release, including authoritative absence of a previously
 acquired VM, retains a terminal local tombstone. Absence while a clone is still
@@ -416,6 +417,53 @@ uncertain does not prove completion and retains the attempt. Checked deletion
 records its phase before stopping/purging, so a retry can reconcile a lost delete
 response without reopening acquisition. The fixed lease ID is single-use and
 cannot allocate another VM after release.
+
+### Recovering an unresolved fixed-ID clone attempt
+
+A retained `prepared` attempt has no evidence of its clone outcome. This
+includes claims written by v0.66.0 and earlier releases. Replay and ordinary
+`stop` both refuse it, and its reserved VMID blocks later fixed leases in the
+same state directory. After checking the cluster, settle it explicitly:
+
+```sh
+crabbox stop --force --provider proxmox --id <canonical-cbx-id>
+```
+
+Recovery accepts only a `prepared` fixed claim in the configured endpoint and
+node scope. It must have no bound `vmgenid`, failed attempts, checkpoint, or
+coordinator or runtime-adapter owner, and no other local claim may bind its
+VMID. A submitted attempt must match its persisted VMID, node and identity
+labels. A claim without an attempt cannot have sent a clone: every release with
+Proxmox fixed IDs, from v0.64.0, persists the VMID before cloning.
+
+Under the claim lock, Crabbox repeats complete cluster inventory and the audited
+VMID lookup every 15 seconds. It settles only if every check finds neither the
+VMID nor a VM carrying the lease or provider key, for at least 5 minutes. The
+lock excludes the original acquisition. Proxmox forks the clone worker only
+after its permission checks, and the worker writes the new VMID configuration
+before copying disks. The 5 minutes outlasts the 30-second API proxy timeout and
+queued API workers, so an accepted clone request becomes visible within it.
+
+Any presence, including another VM reusing the VMID, any failed or unauthorized
+read, or cancellation retains the claim and key unchanged. Otherwise Crabbox
+writes the terminal tombstone and removes the per-lease SSH key. The lease ID is
+spent: replay fails, ordinary `stop` succeeds without changes, even after
+another lease reuses the VMID, and rerunning the recovery succeeds without
+contacting Proxmox. The tombstone no longer
+reserves the VMID. Recovery never adopts, clones or deletes a VM.
+
+Before settling, and for every retained proof, Crabbox writes one private JSON
+record to `fixed-recovery/<lease-id>/<start-time>.json` in the state directory
+that holds `claims/`. It contains:
+
+- `outcome` (`proven` or `retained`) and `reason`
+- lease ID, claim provider, provider scope and intent fingerprint
+- claim revision and SHA-256 of the exact claim bytes
+- journal phase, `attempt` (`submitted` or `unsubmitted`), VMID and node
+- grace, start and finish times, and the time and result of each check
+
+A record is audit history only. Settlement never reuses an earlier record, so a
+restart between proof and settlement proves absence again.
 
 ### Automatic cleanup ownership
 

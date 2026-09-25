@@ -285,7 +285,12 @@ definite failure may call `tx.RejectAttempt`; unknown outcomes retain custody.
 The claim may carry only the identity that the same transaction's plan reserved,
 such as a requested VMID, and nothing may have been bound or observed since
 admission. Bound evidence returned by the provider, or an attempt planned by an
-earlier invocation, cannot be rejected.
+earlier invocation, cannot be rejected. `SettleUnresolvedFixedAttempt` is the
+explicit operator counterpart for a prepared attempt with no bound generation or
+other owner. Under the unchanged claim fence, the adapter's proof must show that
+no resource exists and none can still appear; core never infers that from the
+claim or reuses an earlier proof. `WriteFixedRecoveryEvidence` records each
+attempt as audit history.
 Adapters treat the transaction claim as read-only and return attested binding
 evidence from `ObserveExact`, or publish partial native results through `tx.Bind`
 or `tx.Observe`. Core persists observation bindings before preparing access and
