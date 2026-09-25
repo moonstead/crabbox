@@ -52,6 +52,11 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 	forbidServerTypeOverride := fs.Bool("forbid-server-type-override", controllerEnvBool("CRABBOX_ADAPTER_FORBID_SERVER_TYPE_OVERRIDE"), "reject nonempty request serverType values")
 	binary := fs.String("crabbox-binary", getenv("CRABBOX_ADAPTER_BINARY", defaultBinary), "Crabbox executable used for lifecycle commands")
 	workDir := fs.String("work-dir", getenv("CRABBOX_ADAPTER_WORK_DIR", ""), "working directory for lifecycle commands")
+	commands := map[string][]string{}
+	fs.Func("command", `opt-in workspace command NAME=["/absolute/program","arg"] (repeatable)`, func(value string) error {
+		return parseControllerCommandDefinition(value, commands)
+	})
+	commandTimeout := fs.Duration("command-timeout", controllerEnvDuration("CRABBOX_ADAPTER_COMMAND_TIMEOUT", controllerCommandDefaultTimeout), "maximum workspace command duration")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -80,6 +85,9 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 		if value <= 0 {
 			return Exit(2, "--%s must be greater than zero", name)
 		}
+	}
+	if *commandTimeout <= 0 || *commandTimeout > controllerCommandMaximumDuration {
+		return Exit(2, "--command-timeout must be greater than zero and at most %s", controllerCommandMaximumDuration)
 	}
 	if strings.TrimSpace(*vncURLTemplate) != "" && !*allowDesktop {
 		return Exit(2, "--vnc-url-template requires --allow-desktop")
@@ -116,6 +124,8 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 		RequiredIdleSeconds:      requiredIdleSeconds,
 		ForbidClassOverride:      *forbidClassOverride,
 		ForbidServerTypeOverride: *forbidServerTypeOverride,
+		Commands:                 commands,
+		CommandTimeout:           *commandTimeout,
 	}
 	runnerConfig := expandUserPath(strings.TrimSpace(*configPath))
 	runnerProvider := strings.TrimSpace(*provider)
@@ -167,7 +177,7 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 		Handler:           service,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      *connectionTimeout + 10*time.Second,
+		WriteTimeout:      max(*connectionTimeout, *commandTimeout) + 10*time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 		BaseContext: func(net.Listener) context.Context {
@@ -176,6 +186,9 @@ func (a App) controllerServe(ctx context.Context, args []string) error {
 	}
 	service.startReconciliation()
 	fmt.Fprintf(a.Stderr, "adapter listening=%s state=%s provider=%s profile=%s id=%s max_concurrent=%d\n", strings.Join(listenerNames, ","), opts.StateFile, blank(*provider, "config"), blank(*profile, "default"), blank(*adapterID, "unbound"), opts.MaxConcurrent)
+	if len(commands) > 0 {
+		fmt.Fprintf(a.Stderr, "adapter workspace commands enabled=%s timeout=%s\n", strings.Join(service.commandNames(), ","), *commandTimeout)
+	}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)

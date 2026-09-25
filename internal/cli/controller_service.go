@@ -40,6 +40,8 @@ type controllerCapabilities struct {
 	Desktop bool `json:"desktop"`
 	Browser bool `json:"browser"`
 	Code    bool `json:"code"`
+	// Commands opts this workspace into the adapter's operator-defined commands.
+	Commands bool `json:"commands,omitempty"`
 }
 
 type controllerWorkspaceResponseCapabilities struct {
@@ -149,6 +151,9 @@ type controllerServiceOptions struct {
 	RequiredIdleSeconds      int
 	ForbidClassOverride      bool
 	ForbidServerTypeOverride bool
+	// Commands maps operator-defined names to fixed argv; empty disables them.
+	Commands       map[string][]string
+	CommandTimeout time.Duration
 }
 
 type controllerWorkspaceRunner interface {
@@ -197,6 +202,7 @@ type controllerService struct {
 	createOps          map[string]*controllerCreateOperation
 	reconcileTimers    map[string]*controllerReconcileTimer
 	connectionSlots    map[string]chan struct{}
+	commandSlots       map[string]chan struct{}
 	localCleanupRetry  map[string]struct{}
 	terminalRevocation map[string]controllerTerminalRevocation
 	desktopSetups      chan struct{}
@@ -328,6 +334,14 @@ func newControllerServiceWithStateSaver(
 	if err := validateControllerCoordinatorRegistrationURL(providerIdentity.CoordinatorRegistrationURL); err != nil {
 		return nil, fmt.Errorf("controller coordinator registration binding: %w", err)
 	}
+	if len(opts.Commands) > 0 {
+		commandCtx, cancelCommand := context.WithTimeout(ctx, opts.InspectTimeout)
+		err := verifyControllerCommandSupport(commandCtx, runner, providerIdentity.Route)
+		cancelCommand()
+		if err != nil {
+			return nil, err
+		}
+	}
 	s := &controllerService{
 		ctx:                        ctx,
 		opts:                       opts,
@@ -347,6 +361,7 @@ func newControllerServiceWithStateSaver(
 		createOps:                  map[string]*controllerCreateOperation{},
 		reconcileTimers:            map[string]*controllerReconcileTimer{},
 		connectionSlots:            map[string]chan struct{}{},
+		commandSlots:               map[string]chan struct{}{},
 		localCleanupRetry:          map[string]struct{}{},
 		terminalRevocation:         map[string]controllerTerminalRevocation{},
 		desktopSetups:              make(chan struct{}, 1),
@@ -566,6 +581,14 @@ func (s *controllerService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeControllerError(w, http.StatusUnauthorized, "unauthorized", "valid bearer token required")
 		return
 	}
+	if r.URL.Path == "/v1/commands" && len(s.opts.Commands) > 0 {
+		if r.Method != http.MethodGet {
+			writeControllerMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		s.listCommands(w)
+		return
+	}
 	if r.URL.Path == "/v1/workspaces" {
 		if r.Method != http.MethodPost {
 			writeControllerMethodNotAllowed(w, http.MethodPost)
@@ -591,6 +614,14 @@ func (s *controllerService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.desktopConnection(w, r.Context(), id)
+		return
+	}
+	if len(parts) == 3 && parts[1] == "commands" && len(s.opts.Commands) > 0 {
+		if r.Method != http.MethodPost {
+			writeControllerMethodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.runWorkspaceCommand(w, r, id, parts[2])
 		return
 	}
 	if len(parts) != 1 {
@@ -2512,6 +2543,9 @@ func validateControllerWorkspaceRequest(request controllerWorkspaceRequest, opts
 	}
 	if request.Capabilities.Code && !opts.Allowed.Code {
 		return fmt.Errorf("code capability is disabled by this controller")
+	}
+	if request.Capabilities.Commands && len(opts.Commands) == 0 {
+		return fmt.Errorf("commands capability is disabled by this controller")
 	}
 	if err := validateControllerLeaseSeconds("ttlSeconds", request.TTLSeconds); err != nil {
 		return err

@@ -402,6 +402,71 @@ transport restriction, and may not contain user information, query strings, or
 fragments. The adapter checks status, lease identity, and effective expiry
 again after setup and revokes the local bridge if the lifecycle changed.
 
+## Workspace commands
+
+Workspace commands are an opt-in way to run an operator-approved program on a
+ready workspace, for example a one-time agent enrolment that reads a private
+token from stdin. They are off unless `adapter serve` starts with at least one
+`--command` flag. With no `--command` flag, the routes below do not exist and
+return `404`.
+
+```sh
+crabbox adapter serve ... \
+  --command 'enrol=["/usr/local/bin/agent-enrol","--token-stdin"]' \
+  --command-timeout 5m
+```
+
+The operator fixes every argv at startup. `argv[0]` must be an absolute path,
+and names are lowercase DNS-style labels. Callers choose a name; they cannot
+supply or change arguments, environment, files or a shell. If the approved
+program is a shell or interpreter that reads its program from stdin, callers can
+run arbitrary code, so approve only the programs you intend to expose.
+
+A workspace can run commands only if its creation request set
+`"capabilities": {"commands": true}`. The adapter rejects that capability when
+no command is configured.
+
+```http
+GET /v1/commands
+POST /v1/workspaces/{id}/commands/{name}
+Content-Type: application/json
+
+{"stdinBase64":"<standard base64>","timeoutSeconds":120}
+```
+
+`GET /v1/commands` returns the contract version, the configured names (never
+their argv) and the limits. The run request body is optional. The response is
+`{"exitCode":0,"stdoutBase64":"...","stderrBase64":"...","stdoutTruncated":false,"stderrTruncated":false}`.
+
+The adapter:
+
+- requires the bearer token, a workspace in `ready` state that is not expired
+  or cleaning up, and a canonical lease ID, and checks them again when the
+  command starts and before it releases the result
+- runs `crabbox exec --id <lease-id> -- <argv>` as a tracked child, so provider
+  and SSH credentials never leave the adapter host
+- passes stdin to that child through a private pipe only, never through argv,
+  the environment, controller state, logs or error responses, and clears its
+  decoded copy after the command
+- limits stdin to 32 KiB and captures at most 16 KiB each of stdout and stderr,
+  marking truncated output
+- runs one command at a time per workspace, within the lifecycle concurrency
+  limit, and rejects a second one with `409`
+- ends the command's deadline no later than the workspace expiry, and stops
+  its process tree on timeout, when the client disconnects, and when the
+  workspace is deleted, expires or loses state durability; it then withholds
+  the result and returns `409`, `503` or `504`
+- writes one audit line per command with the workspace, lease, command name,
+  outcome, exit code, output sizes and duration, but no input or output
+
+`exitCode` is the exit status of `crabbox exec`: the remote command's status,
+or a Crabbox setup or SSH transport failure (for example `255`), which the
+adapter cannot distinguish. `adapter serve` refuses to start with `--command`
+unless `crabbox exec --check` reports `"execution": true` for its provider.
+
+The coordinator relay and `adapter connect` do not forward these routes. Only
+local clients that hold the adapter token can use them.
+
 ## Lifecycle and recovery
 
 The adapter holds an exclusive process-lifetime lock beside the state file.
@@ -537,9 +602,11 @@ Flags:
 --forbid-server-type-override    reject nonempty request serverType values
 --crabbox-binary <path>          lifecycle executable
 --work-dir <path>                lifecycle working directory
+--command <name>=<json-argv>     opt-in workspace command; repeatable; flag only
+--command-timeout <duration>     default 2m; maximum 1h
 ```
 
-Every flag has a `CRABBOX_ADAPTER_*` environment equivalent. Flags override
+Every flag except `--command` has a `CRABBOX_ADAPTER_*` environment equivalent. Flags override
 environment values. Provider credentials remain in the provider's normal
 credential store or child environment; never put them in HTTP requests.
 

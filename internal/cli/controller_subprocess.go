@@ -383,6 +383,49 @@ func (r *execControllerWorkspaceRunner) Stop(ctx context.Context, identifier str
 	return nil
 }
 
+// CommandExecutionSupported runs the offline `crabbox exec --check` for the
+// configured provider route.
+func (r *execControllerWorkspaceRunner) CommandExecutionSupported(ctx context.Context) (bool, error) {
+	args := r.appendProviderArg([]string{"exec", "--check"}, controllerWorkspaceRequest{})
+	output := prefixbuffer.NewLimited(controllerOutputLimitBytes)
+	if err := r.runWithStarted(ctx, controllerWorkspaceRequest{}, args, &output, nil); err != nil {
+		return false, err
+	}
+	if err := controllerOutputOverflowError(output.Exceeded(), "crabbox exec capability check", controllerOutputLimitBytes); err != nil {
+		return false, err
+	}
+	var view struct {
+		Execution bool `json:"execution"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &view); err != nil {
+		return false, fmt.Errorf("decode crabbox exec capability check: %w", err)
+	}
+	return view.Execution, nil
+}
+
+// RunWorkspaceCommand runs one operator-defined argv through crabbox exec.
+// Provider and SSH credentials stay with the child; stdin is delivered only
+// through the private input pipe. A nonzero command exit is a result, not an error.
+func (r *execControllerWorkspaceRunner) RunWorkspaceCommand(ctx context.Context, leaseID string, request controllerWorkspaceRequest, argv []string, stdin []byte, stdout, stderr io.Writer) (int, error) {
+	if !IsCanonicalLeaseID(leaseID) || len(argv) == 0 {
+		return 0, fmt.Errorf("workspace command requires a canonical lease ID and argv")
+	}
+	args, err := r.appendPersistedProviderRoutingArgs([]string{"exec", "--id", leaseID}, request)
+	if err != nil {
+		return 0, err
+	}
+	args = append(append(args, "--"), argv...)
+	if stdin == nil {
+		stdin = []byte{}
+	}
+	err = r.runTrackedChild(ctx, request, args, controllerChildStreams{Stdout: stdout, Stderr: stderr, Input: stdin}, nil, nil)
+	var exitErr *controllerCommandError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode, nil
+	}
+	return 0, err
+}
+
 func (r *execControllerWorkspaceRunner) ConfirmAbsent(ctx context.Context, identifier string, request controllerWorkspaceRequest) (bool, error) {
 	return r.workspaceAbsent(ctx, identifier, request)
 }
@@ -1021,17 +1064,35 @@ func (r *execControllerWorkspaceRunner) runWithStarted(ctx context.Context, requ
 }
 
 func (r *execControllerWorkspaceRunner) runWithStartedEnv(ctx context.Context, request controllerWorkspaceRequest, args []string, stdout io.Writer, onStarted func() error, extraEnv map[string]string) error {
+	return r.runTrackedChild(ctx, request, args, controllerChildStreams{Stdout: stdout}, onStarted, extraEnv)
+}
+
+// controllerChildStreams carries optional private input for a tracked child.
+// Input reaches the child only through an inherited pipe: never argv,
+// environment, logs, or controller state.
+type controllerChildStreams struct {
+	Stdout io.Writer
+	Stderr io.Writer
+	Input  []byte
+}
+
+func (r *execControllerWorkspaceRunner) runTrackedChild(ctx context.Context, request controllerWorkspaceRequest, args []string, streams controllerChildStreams, onStarted func() error, extraEnv map[string]string) error {
+	stdout := streams.Stdout
 	policy, err := r.childCredentialPolicy(request, args)
 	if err != nil {
 		return fmt.Errorf("resolve crabbox %s child credential boundary: %w", args[0], err)
 	}
+	private := streams.Input != nil || streams.Stderr != nil
 	if policy.ownerName != "" {
-		if onStarted != nil {
-			return fmt.Errorf("credential-owning crabbox %s child cannot use a tracked launch callback", args[0])
+		if onStarted != nil || private {
+			return fmt.Errorf("credential-owning crabbox %s child cannot use a tracked launch callback or private streams", args[0])
 		}
 		return r.runWithStartedUntrackedEnvPolicy(ctx, request, args, stdout, nil, extraEnv, policy)
 	}
 	if strings.TrimSpace(r.controllerStatePath()) == "" {
+		if private {
+			return fmt.Errorf("crabbox %s child with private streams requires the durable child registry", args[0])
+		}
 		return r.runWithStartedUntrackedEnvPolicy(ctx, request, args, stdout, onStarted, extraEnv, policy)
 	}
 	nonce, err := newWebVNCDaemonNonce()
@@ -1044,7 +1105,18 @@ func (r *execControllerWorkspaceRunner) runWithStartedEnv(ctx context.Context, r
 	}
 	defer gateWriter.Close()
 	childArgs := append([]string{r.opts.Binary}, args...)
-	cmdArgs := []string{"-c", controllerTrackedChildScript(), "crabbox-controller-child-" + nonce}
+	script := controllerTrackedChildScript()
+	var inputReader, inputWriter *os.File
+	if streams.Input != nil {
+		script = controllerTrackedChildInputScript()
+		inputReader, inputWriter, err = os.Pipe()
+		if err != nil {
+			_ = gateReader.Close()
+			return fmt.Errorf("create crabbox %s input pipe: %w", args[0], err)
+		}
+		defer inputWriter.Close()
+	}
+	cmdArgs := []string{"-c", script, "crabbox-controller-child-" + nonce}
 	cmdArgs = append(cmdArgs, childArgs...)
 	cmd := exec.CommandContext(ctx, "sh", cmdArgs...)
 	configureControllerCommand(cmd)
@@ -1058,11 +1130,22 @@ func (r *execControllerWorkspaceRunner) runWithStartedEnv(ctx context.Context, r
 	cmd.Stdin = gateReader
 	cmd.Stdout = stdout
 	cmd.Stderr = io.Discard
+	if streams.Stderr != nil {
+		cmd.Stderr = streams.Stderr
+	}
+	if inputReader != nil {
+		// Descriptor 3 is reserved for the launch gate; input is descriptor 4.
+		cmd.ExtraFiles = []*os.File{nil, inputReader}
+	}
 	cmd.Env = r.childEnvironmentWithPolicy(os.Environ(), request, r.adapterChildEnv(extraEnv), policy)
 	cmd.WaitDelay = controllerChildWaitDelay
-	if err := cmd.Start(); err != nil {
+	startErr := cmd.Start()
+	if inputReader != nil {
+		_ = inputReader.Close()
+	}
+	if startErr != nil {
 		_ = gateReader.Close()
-		return fmt.Errorf("start crabbox %s launch gate: %w", args[0], err)
+		return fmt.Errorf("start crabbox %s launch gate: %w", args[0], startErr)
 	}
 	_ = gateReader.Close()
 	identityPath, err := r.registerControllerChild(cmd.Process.Pid, request.ID, args[0], nonce)
@@ -1097,7 +1180,23 @@ func (r *execControllerWorkspaceRunner) runWithStartedEnv(ctx context.Context, r
 		_ = cmd.Wait()
 		return errors.Join(fmt.Errorf("release crabbox %s launch gate: %w", args[0], err), terminateAndCleanupIdentity())
 	}
+	var inputDone chan struct{}
+	if inputWriter != nil {
+		// A child may exit without reading its input; that is not a launch error.
+		inputDone = make(chan struct{})
+		go func() {
+			defer close(inputDone)
+			_, _ = inputWriter.Write(streams.Input)
+			_ = inputWriter.Close()
+		}()
+	}
 	waitErr := cmd.Wait()
+	if inputDone != nil {
+		// Unblock a write the child never read, and release the caller's buffer
+		// only after the writer has finished with it.
+		_ = inputWriter.Close()
+		<-inputDone
+	}
 	_ = gateWriter.Close()
 	groupErr := terminateControllerProcessGroup(cmd.Process.Pid)
 	var cleanupErr error
@@ -1117,6 +1216,21 @@ func controllerTrackedChildScript() string {
 		"( IFS= read -r _ <&3 && exit 0; /bin/kill -KILL -- -$$ || /bin/kill -KILL $$ ) >/dev/null 2>&1 &\n" +
 		"\"$@\" </dev/null &\n" +
 		"child=$!\n" +
+		"wait \"$child\"\n" +
+		"code=$?\n" +
+		"exit \"$code\"\n"
+}
+
+// controllerTrackedChildInputScript matches controllerTrackedChildScript but
+// gives the child descriptor 4, the private input pipe, as its stdin.
+func controllerTrackedChildInputScript() string {
+	return "exec 3<&0\n" +
+		"IFS= read -r gate <&3 || exit 125\n" +
+		"[ \"$gate\" = run ] || exit 125\n" +
+		"( IFS= read -r _ <&3 && exit 0; /bin/kill -KILL -- -$$ || /bin/kill -KILL $$ ) 4<&- >/dev/null 2>&1 &\n" +
+		"\"$@\" <&4 4<&- &\n" +
+		"child=$!\n" +
+		"exec 4<&-\n" +
 		"wait \"$child\"\n" +
 		"code=$?\n" +
 		"exit \"$code\"\n"
