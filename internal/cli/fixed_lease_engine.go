@@ -56,6 +56,9 @@ type FixedTransaction struct {
 	persist      func() error
 	admission    *FixedAdmission
 	now          func() time.Time
+	// planned is the identity this transaction's plan reserved before
+	// submission. It names the requested resource; it is not creation evidence.
+	planned FixedResourceBinding
 }
 
 func newFixedTransaction(claim *LeaseClaim, fresh bool, persist func() error) (*FixedTransaction, error) {
@@ -484,9 +487,11 @@ func (tx *FixedTransaction) FailedAttemptSet() map[string]bool {
 
 // RejectAttempt requires a provider-certified definite failure. Transport
 // uncertainty must never call this: it retains the current attempt instead.
+// The claim may carry only the identity this transaction's plan reserved.
 func (tx *FixedTransaction) RejectAttempt(kind FixedLeaseKind, token string, terminal bool) error {
 	intent := tx.Claim.FixedCreateIntent
-	if !kind.IsFixedClaim(*tx.Claim) || intent.Version != kind.IntentVersion || intent.State != "prepared" || token == "" || tx.Claim.CloudID != "" || tx.Claim.CloudNumericID != 0 || tx.Claim.CloudImmutableID != "" {
+	if !kind.IsFixedClaim(*tx.Claim) || intent.Version != kind.IntentVersion || intent.State != "prepared" || token == "" ||
+		tx.Claim.CloudID != tx.planned.CloudID || tx.Claim.CloudNumericID != tx.planned.NumericID || tx.Claim.CloudImmutableID != tx.planned.ImmutableID {
 		return Exit(4, "lease_id_conflict: cannot reject a bound or unidentified fixed attempt")
 	}
 	if terminal {

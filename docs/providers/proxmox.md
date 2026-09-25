@@ -397,6 +397,19 @@ or generation recording was interrupted, inspection is required: copied labels
 cannot establish the missing generation binding. A bound but incomplete bootstrap
 can be stopped safely; replay does not declare it ready merely because SSH works.
 
+Proxmox authenticates and authorizes a clone request, including storage and
+`SDN.Use` bridge checks, before it forks the clone task. When the clone request
+itself returns HTTP 401 or 403, Crabbox treats the attempt as definitely
+rejected. It then requires complete cluster inventory and an audited VMID lookup
+to show neither the reserved VMID nor a VM carrying the lease. Only then does it
+write a terminal tombstone, remove the per-lease SSH key and report
+`lease_id_conflict` with the Proxmox error. The lease ID is spent: fix the
+permission and retry with a new lease ID. The tombstone no longer reserves the
+VMID, so later leases can use it. Any other clone failure, including transport
+errors, other HTTP statuses, task failures, and a rejection whose absence check
+fails, retains the prepared attempt as before. Attempts retained by earlier
+releases carry no rejection evidence and remain retained.
+
 Successful fixed-ID release, including authoritative absence of a previously
 acquired VM, retains a terminal local tombstone. Absence while a clone is still
 uncertain does not prove completion and retains the attempt. Checked deletion

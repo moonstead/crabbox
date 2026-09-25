@@ -1663,3 +1663,55 @@ func TestProxmoxFixedCloneTaskFailurePreservesAttempt(t *testing.T) {
 		t.Fatalf("err=%v post-clone mutations=%d; uncertain fixed attempt must be retained", err, mutations)
 	}
 }
+
+func TestProxmoxCloneRejectionClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		upid     bool
+		rejected bool
+	}{
+		{name: "authentication", status: http.StatusUnauthorized, rejected: true},
+		{name: "authorization", status: http.StatusForbidden, rejected: true},
+		{name: "parameter", status: http.StatusBadRequest},
+		{name: "not found", status: http.StatusNotFound},
+		{name: "server", status: http.StatusInternalServerError},
+		{name: "gateway", status: http.StatusBadGateway},
+		{name: "task", status: http.StatusForbidden, upid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutations := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/qemu/9000/clone":
+					if tc.upid {
+						_ = json.NewEncoder(w).Encode(map[string]any{"data": "UPID:pve1:clone"})
+						return
+					}
+					http.Error(w, "Permission check failed (/sdn/zones/localnetwork/vmbr0, SDN.Use)", tc.status)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/status"):
+					// A rejection reported by the clone task happens after the task started.
+					http.Error(w, "task status denied", tc.status)
+				default:
+					mutations++
+					http.Error(w, "unexpected request", http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+			client := testProxmoxClient(t, server.URL)
+			cfg := baseConfig()
+			cfg.Proxmox.Node, cfg.Proxmox.TemplateID = "pve1", 9000
+			_, err := client.CreateServerWithVMID(context.Background(), cfg, "ssh-ed25519 AAAA test", "cbx_123456abcdef", "fixed", false, 417, map[string]string{"fixed_intent_sha256": "fixture"}, func(Server) error { return nil })
+			if err == nil || mutations != 0 {
+				t.Fatalf("err=%v mutations=%d", err, mutations)
+			}
+			if got := IsProxmoxCloneRejected(err); got != tc.rejected {
+				t.Fatalf("IsProxmoxCloneRejected=%t, want %t: %v", got, tc.rejected, err)
+			}
+			var proxErr *ProxmoxError
+			if !tc.upid && (!errors.As(err, &proxErr) || proxErr.StatusCode != tc.status) {
+				t.Fatalf("clone error lost its Proxmox status: %v", err)
+			}
+		})
+	}
+}

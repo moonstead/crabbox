@@ -65,6 +65,17 @@ type ProxmoxDeleteRequestError struct {
 func (e *ProxmoxDeleteRequestError) Error() string { return e.Err.Error() }
 func (e *ProxmoxDeleteRequestError) Unwrap() error { return e.Err }
 
+// ProxmoxCloneRejectedError marks a clone request that Proxmox refused while
+// authenticating or authorizing it. Proxmox decides both before it forks the
+// clone task, so this request cannot have created the requested VM. Other
+// failures, including every transport, server and task error, stay ambiguous.
+type ProxmoxCloneRejectedError struct {
+	Err *ProxmoxError
+}
+
+func (e *ProxmoxCloneRejectedError) Error() string { return e.Err.Error() }
+func (e *ProxmoxCloneRejectedError) Unwrap() error { return e.Err }
+
 type proxmoxTaskWaitError struct {
 	err error
 }
@@ -1056,6 +1067,10 @@ func (c *ProxmoxClient) CreateServerWithVMID(ctx context.Context, cfg Config, pu
 	}
 	var upid string
 	if err := c.doRequired(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/qemu/%d/clone", url.PathEscape(c.Node), cfg.Proxmox.TemplateID), clone, &upid); err != nil {
+		var proxErr *ProxmoxError
+		if errors.As(err, &proxErr) && (proxErr.StatusCode == http.StatusUnauthorized || proxErr.StatusCode == http.StatusForbidden) {
+			return Server{}, &ProxmoxCloneRejectedError{Err: proxErr}
+		}
 		return Server{}, err
 	}
 	clonedVMID := strconv.Itoa(vmid)
@@ -1510,6 +1525,11 @@ func IsCrabboxProxmoxLease(server Server) bool {
 func IsProxmoxNotFound(err error) bool {
 	var proxErr *ProxmoxError
 	return errors.As(err, &proxErr) && proxErr.StatusCode == http.StatusNotFound
+}
+
+func IsProxmoxCloneRejected(err error) bool {
+	var rejected *ProxmoxCloneRejectedError
+	return errors.As(err, &rejected)
 }
 
 func IsProxmoxDeleteTaskError(err error) bool {

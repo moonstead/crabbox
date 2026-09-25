@@ -282,6 +282,9 @@ use `DeferredAdmission` and call `tx.Admit` at the mutation boundary. APIs resol
 launch inputs during submission also declare `PlanDuringSubmit` and persist each
 payload with `WriteFixedAttempt` before allocation. Only a provider-certified
 definite failure may call `tx.RejectAttempt`; unknown outcomes retain custody.
+The claim may carry only the identity that the same transaction's plan reserved,
+such as a requested VMID. Bound evidence returned by the provider, or an attempt
+planned by an earlier invocation, cannot be rejected.
 Adapters treat the transaction claim as read-only and return attested binding
 evidence from `ObserveExact`, or publish partial native results through `tx.Bind`
 or `tx.Observe`. Core persists observation bindings before preparing access and

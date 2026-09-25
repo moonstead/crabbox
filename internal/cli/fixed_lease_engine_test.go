@@ -198,3 +198,85 @@ func TestFixedEngineNeverResubmitsBoundClaim(t *testing.T) {
 		t.Fatal("rejected replacement changed custody")
 	}
 }
+
+func TestFixedEngineRejectsOnlyThisTransactionsPlannedIdentity(t *testing.T) {
+	isolateTestUserDirs(t)
+	kind := FixedLeaseKind{ClaimProvider: "fixture-fixed", IntentVersion: 1, Label: "fixture", TerminalIdentityLabels: []string{"lease"}}
+	rejected := errors.New("definite rejection")
+	newOps := func(submit func(*FixedTransaction) (string, error)) FixedLeaseOperations[string] {
+		return FixedLeaseOperations[string]{Admission: &FixedAdmission{FreshOnly: true},
+			DescribeIntent: func(context.Context, *LeaseClaim, bool) (FixedLeaseBinding, error) {
+				return FixedLeaseBinding{ProviderScope: "scope", Fingerprint: "hash", Slug: "fixture"}, nil
+			},
+			Plan: func(context.Context, LeaseClaim) (FixedAttemptPlan, error) {
+				return FixedAttemptPlan{Values: map[string]string{"id": "7"}, Labels: map[string]string{"lease": "cbx_abcdef123411"}, Identity: FixedResourceBinding{CloudID: "7", NumericID: 7}}, nil
+			},
+			ObserveExact: func(_ context.Context, tx *FixedTransaction, _ FixedObserveMode) (FixedObservation[string], error) {
+				if len(tx.Claim.FixedCreateIntent.Attempt) != 0 {
+					// A later invocation did not reserve this identity and cannot certify its rejection.
+					if err := tx.RejectAttempt(kind, "7", true); err == nil || !strings.Contains(err.Error(), "cannot reject") {
+						t.Fatalf("earlier attempt rejected by a later transaction: %v", err)
+					}
+					return FixedObservation[string]{}, nil
+				}
+				return FixedObservation[string]{CanSubmit: true}, nil
+			},
+			Submit: func(_ context.Context, tx *FixedTransaction) (string, error) { return submit(tx) },
+			PrepareAccess: func(_ context.Context, _ *FixedTransaction, id string) (LeaseTarget, error) {
+				return LeaseTarget{LeaseID: "cbx_abcdef123411", Server: Server{CloudID: id}}, nil
+			},
+		}
+	}
+
+	opts := FixedAcquireOptions{Kind: kind, LeaseID: "cbx_abcdef123411", RepoRoot: "/fixture"}
+	ops := newOps(func(tx *FixedTransaction) (string, error) {
+		if err := tx.RejectAttempt(kind, "7", true); err != nil {
+			t.Fatal(err)
+		}
+		return "", rejected
+	})
+	if _, err := AcquireFixedResource(t.Context(), opts, ops); !errors.Is(err, rejected) {
+		t.Fatal(err)
+	}
+	terminal, _ := ReadLeaseClaim(opts.LeaseID)
+	if terminal.FixedCreateIntent.State != "released" || len(terminal.FixedCreateIntent.Attempt) != 0 || terminal.CloudID != "7" || terminal.CloudImmutableID != "" {
+		t.Fatalf("planned rejection did not leave a terminal receipt: %+v", terminal)
+	}
+	if err := kind.ValidateTerminalClaim(terminal, LeaseClaim{}, opts.LeaseID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireFixedResource(t.Context(), opts, ops); err == nil || !strings.Contains(err.Error(), "terminal") {
+		t.Fatalf("rejected ID reopened: %v", err)
+	}
+
+	opts.LeaseID = "cbx_abcdef123412"
+	ops = newOps(func(tx *FixedTransaction) (string, error) {
+		if err := tx.Bind(FixedResourceBinding{ImmutableID: "generation"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.RejectAttempt(kind, "7", true); err == nil || !strings.Contains(err.Error(), "cannot reject") {
+			t.Fatalf("created resource rejected: %v", err)
+		}
+		return "", rejected
+	})
+	if _, err := AcquireFixedResource(t.Context(), opts, ops); !errors.Is(err, rejected) {
+		t.Fatal(err)
+	}
+	bound, _ := ReadLeaseClaim(opts.LeaseID)
+	if bound.FixedCreateIntent.State != "prepared" || bound.FixedCreateIntent.Attempt["id"] != "7" || bound.CloudImmutableID != "generation" {
+		t.Fatalf("bound attempt was not retained: %+v", bound)
+	}
+
+	opts.LeaseID = "cbx_abcdef123413"
+	ops = newOps(func(*FixedTransaction) (string, error) { return "", errors.New("lost reply") })
+	if _, err := AcquireFixedResource(t.Context(), opts, ops); err == nil {
+		t.Fatal("expected uncertain submission")
+	}
+	before, _ := ReadLeaseClaim(opts.LeaseID)
+	if _, err := AcquireFixedResource(t.Context(), opts, ops); err == nil || !strings.Contains(err.Error(), "lease_id_conflict") {
+		t.Fatalf("uncertain replay: %v", err)
+	}
+	if after, _ := ReadLeaseClaim(opts.LeaseID); !reflect.DeepEqual(before, after) {
+		t.Fatal("later rejection attempt changed the retained claim")
+	}
+}

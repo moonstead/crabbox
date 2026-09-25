@@ -203,6 +203,7 @@ func (tx *FixedTransaction) plan(plan FixedAttemptPlan) error {
 	if err := tx.applyBinding(plan.Identity); err != nil {
 		return err
 	}
+	tx.planned = plan.Identity
 	if len(plan.UniqueProviders) != 0 {
 		return ValidateFixedLocalClaimUniqueness(FixedLeaseKind{ClaimProvider: tx.Claim.Provider, Label: plan.UniqueLabel}, *tx.Claim, plan.UniqueProviders...)
 	}

@@ -2,6 +2,7 @@ package proxmox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"strconv"
@@ -14,11 +15,12 @@ import (
 const fixedProxmoxCreateIntentVersion = 1
 
 var fixedProxmoxLeaseKind = core.FixedLeaseKind{
-	ClaimProvider:  core.FixedProxmoxClaimProvider,
-	IntentVersion:  fixedProxmoxCreateIntentVersion,
-	Label:          "Proxmox",
-	DeletionState:  "deleting",
-	ResourcePlural: "Proxmox VMs",
+	RemoveKeyAfterRejection: true,
+	ClaimProvider:           core.FixedProxmoxClaimProvider,
+	IntentVersion:           fixedProxmoxCreateIntentVersion,
+	Label:                   "Proxmox",
+	DeletionState:           "deleting",
+	ResourcePlural:          "Proxmox VMs",
 	TerminalIdentityLabels: []string{
 		"crabbox", "provider", "lease", "slug", "provider_key",
 		"fixed_intent_sha256", "node", "template_id",
@@ -150,12 +152,16 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 		}
 
 		fmt.Fprintf(b.RT.Stderr, "provisioning provider=proxmox lease=%s slug=%s node=%s template=%d vmid=%d keep=%v fixed=true\n", leaseID, intent.Slug, cfg.Proxmox.Node, cfg.Proxmox.TemplateID, vmid, req.Keep)
-		return client.CreateServerWithVMID(ctx, cfg, publicKey, leaseID, intent.Slug, req.Keep, vmid, maps.Clone(claim.Labels), func(created core.Server) error {
+		server, err := client.CreateServerWithVMID(ctx, cfg, publicKey, leaseID, intent.Slug, req.Keep, vmid, maps.Clone(claim.Labels), func(created core.Server) error {
 			if err := validateFixedProxmoxServer(created, *claim, vmid, node); err != nil {
 				return err
 			}
 			return tx.Bind(core.FixedResourceBinding{ImmutableID: created.ImmutableID, Labels: created.Labels})
 		})
+		if core.IsProxmoxCloneRejected(err) {
+			return core.Server{}, rejectFixedProxmoxClone(ctx, client, tx, leaseID, vmid, err)
+		}
+		return server, err
 	}, PrepareAccess: func(ctx context.Context, tx *core.FixedTransaction, server core.Server) (core.LeaseTarget, error) {
 		claim := tx.Claim
 		attemptVMID, attemptNode, err := fixedProxmoxAttempt(*claim)
@@ -253,25 +259,7 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRe
 	if !exists || !fixedProxmoxLeaseKind.IsFixedClaim(expected) {
 		return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has no durable ownership claim", leaseID)
 	}
-	verifyAbsent := func(vmid int) error {
-		remaining, err := client.ListCrabboxServersCluster(ctx)
-		if err != nil {
-			return fmt.Errorf("verify fixed Proxmox release inventory: %w", err)
-		}
-		for _, candidate := range remaining {
-			if candidate.CloudID == strconv.Itoa(vmid) || candidate.Labels["lease"] == leaseID {
-				return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s still has a surviving VM", leaseID)
-			}
-		}
-		present, err := client.VMExistsInCluster(ctx, strconv.Itoa(vmid))
-		if err != nil {
-			return fmt.Errorf("verify fixed Proxmox VMID %d absence: %w", vmid, err)
-		}
-		if present {
-			return core.Exit(4, "lease_id_conflict: fixed Proxmox VMID %d still exists after release", vmid)
-		}
-		return nil
-	}
+	verifyAbsent := func(vmid int) error { return verifyFixedProxmoxAbsence(ctx, client, leaseID, vmid) }
 	return core.DeleteFixedResource(ctx, fixedProxmoxLeaseKind, expected, core.FixedLeaseOperations[core.Server]{
 		ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[core.Server], error) {
 			claim := tx.Claim
@@ -341,6 +329,44 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRe
 			return verifyAbsent(vmid)
 		},
 	})
+}
+
+// verifyFixedProxmoxAbsence requires complete cluster inventory and an audited
+// VMID lookup. It never infers absence from one node or one missing list row.
+func verifyFixedProxmoxAbsence(ctx context.Context, client proxmoxClient, leaseID string, vmid int) error {
+	remaining, err := client.ListCrabboxServersCluster(ctx)
+	if err != nil {
+		return fmt.Errorf("verify fixed Proxmox inventory: %w", err)
+	}
+	for _, candidate := range remaining {
+		if candidate.CloudID == strconv.Itoa(vmid) || candidate.Labels["lease"] == leaseID {
+			return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s still has a surviving VM", leaseID)
+		}
+	}
+	present, err := client.VMExistsInCluster(ctx, strconv.Itoa(vmid))
+	if err != nil {
+		return fmt.Errorf("verify fixed Proxmox VMID %d absence: %w", vmid, err)
+	}
+	if present {
+		return core.Exit(4, "lease_id_conflict: fixed Proxmox VMID %d still exists", vmid)
+	}
+	return nil
+}
+
+// Proxmox authenticates and authorizes a clone request before it forks the
+// clone task, so a certified rejection cannot have created the reserved VM.
+// Settle only that attempt, and only while complete cluster inventory still
+// shows neither its VMID nor its lease. The terminal tombstone spends the lease
+// ID and releases the reserved VMID for other leases; any uncertainty retains
+// the prepared attempt for inspection.
+func rejectFixedProxmoxClone(ctx context.Context, client proxmoxClient, tx *core.FixedTransaction, leaseID string, vmid int, cause error) error {
+	if err := verifyFixedProxmoxAbsence(ctx, client, leaseID, vmid); err != nil {
+		return errors.Join(cause, fmt.Errorf("retain rejected Proxmox clone attempt: %w", err))
+	}
+	if err := tx.RejectAttempt(fixedProxmoxLeaseKind, strconv.Itoa(vmid), true); err != nil {
+		return errors.Join(cause, err)
+	}
+	return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s terminated after Proxmox rejected its clone request: %v", leaseID, cause)
 }
 
 func validateFixedProxmoxTerminalClaim(claim core.LeaseClaim) error {
