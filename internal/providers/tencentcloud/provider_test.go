@@ -1,6 +1,7 @@
 package tencentcloud
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -330,6 +332,194 @@ func TestInvalidExplicitMarketRejectsBeforeClientOrKey(t *testing.T) {
 	}
 }
 
+func newAcquireTestBackend(t *testing.T, api *fakeTencentCloudAPI, stderr io.Writer) *Backend {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := core.BaseConfig()
+	cfg.TencentCloud.Image = "img-test"
+	b := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: stderr}).(*Backend)
+	b.clientFactory = func(core.Config, core.Runtime) (tencentCloudAPI, error) { return api, nil }
+	return b
+}
+
+func TestAcquireCleanupErrorPreservesCausesAndVetoesRetry(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		for _, tc := range []struct {
+			name             string
+			primary, cleanup error
+			wantCode         int
+		}{
+			{name: "bootstrap timeout", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: errors.New("terminate unavailable"), wantCode: 5},
+			{name: "cancellation", primary: context.Canceled, cleanup: errors.New("terminate unavailable"), wantCode: 1},
+			{name: "primary exit wins", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: core.Exit(9, "terminate unavailable"), wantCode: 5},
+			{name: "cleanup timeout cannot trigger retry", primary: context.Canceled, cleanup: core.Exit(5, "timed out waiting for SSH during cleanup"), wantCode: 5},
+		} {
+			t.Run(tc.name+"/keep="+strconv.FormatBool(keep), func(t *testing.T) {
+				api := &fakeTencentCloudAPI{item: instance{InstanceID: "ins-test", PublicIPAddresses: []string{"203.0.113.25"}}, terminateErr: tc.cleanup}
+				var stderr bytes.Buffer
+				b := newAcquireTestBackend(t, api, &stderr)
+				b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error { return tc.primary }
+				_, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "cause-retained", Keep: keep})
+				if !errors.Is(err, tc.primary) || !errors.Is(err, tc.cleanup) || core.ExitCodeForError(err, 1) != tc.wantCode {
+					t.Errorf("err=%v code=%d wantCode=%d", err, core.ExitCodeForError(err, 1), tc.wantCode)
+				}
+				if api.runCalls != 1 || len(api.terminated) != 1 || api.terminated[0] != "ins-test" || api.replaceCalls != 0 {
+					t.Errorf("creates=%d terminated=%v tagUpdates=%d", api.runCalls, api.terminated, api.replaceCalls)
+				}
+				if !strings.Contains(stderr.String(), "tencentcloud cleanup failed:") || !strings.Contains(stderr.String(), tc.cleanup.Error()) || !strings.Contains(stderr.String(), "refusing a fresh lease retry") || strings.Contains(stderr.String(), "retrying with fresh lease") {
+					t.Errorf("cleanup warning=%q", stderr.String())
+				}
+			})
+		}
+	}
+}
+
+func TestAcquireStillRetriesAfterSuccessfulRollback(t *testing.T) {
+	api := &fakeTencentCloudAPI{item: instance{InstanceID: "ins-test", PublicIPAddresses: []string{"203.0.113.25"}}}
+	var stderr bytes.Buffer
+	b := newAcquireTestBackend(t, api, &stderr)
+	waits := 0
+	b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		waits++
+		if waits == 1 {
+			return core.Exit(5, "timed out waiting for SSH")
+		}
+		return nil
+	}
+	lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "safe-retry"})
+	if err != nil || lease.Server.CloudID != "ins-test" || waits != 2 || api.runCalls != 2 || len(api.terminated) != 1 || api.replaceCalls != 1 {
+		t.Fatalf("err=%v lease=%#v waits=%d creates=%d terminated=%v tagUpdates=%d", err, lease, waits, api.runCalls, api.terminated, api.replaceCalls)
+	}
+	if !strings.Contains(stderr.String(), "retrying with fresh lease") || strings.Contains(stderr.String(), "refusing a fresh lease retry") {
+		t.Fatalf("retry warning=%q", stderr.String())
+	}
+}
+
+func TestAcquireReadinessCancellationSurvivesCleanupFailure(t *testing.T) {
+	cause := errors.New("private cancellation detail")
+	cleanup := core.Exit(5, "timed out waiting for SSH during cleanup")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	api := &fakeTencentCloudAPI{terminateErr: cleanup, getFn: func(ctx context.Context, _ string) (instance, error) {
+		cancel(cause)
+		return instance{}, ctx.Err()
+	}}
+	var stderr bytes.Buffer
+	b := newAcquireTestBackend(t, api, &stderr)
+	b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		t.Fatal("canceled IP readiness reached SSH")
+		return nil
+	}
+	_, err := b.Acquire(ctx, core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "readiness-canceled"})
+	if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || !errors.Is(err, cleanup) || core.ExitCodeForError(err, 1) != 1 || api.runCalls != 1 || len(api.terminated) != 1 {
+		t.Fatalf("err=%v code=%d creates=%d terminated=%v", err, core.ExitCodeForError(err, 1), api.runCalls, api.terminated)
+	}
+	if !strings.Contains(stderr.String(), "refusing a fresh lease retry") || strings.Contains(stderr.String(), "retrying with fresh lease") || strings.Contains(stderr.String(), cause.Error()) {
+		t.Fatalf("cleanup warning=%q", stderr.String())
+	}
+}
+
+func TestWaitForInstanceIPPreservesCallerCause(t *testing.T) {
+	for _, phase := range []string{"before read", "read", "after no-IP response"} {
+		t.Run(phase, func(t *testing.T) {
+			cause := errors.New("private caller cause")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			api := &fakeTencentCloudAPI{getFn: func(ctx context.Context, _ string) (instance, error) {
+				cancel(cause)
+				if phase == "read" {
+					return instance{}, ctx.Err()
+				}
+				return instance{}, nil
+			}}
+			if phase == "before read" {
+				cancel(cause)
+			}
+			_, err := new(Backend).waitForInstanceIP(ctx, api, "ins-test")
+			wantCalls := 1
+			if phase == "before read" {
+				wantCalls = 0
+			}
+			if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || err.Error() != context.Canceled.Error() || api.getCalls != wantCalls {
+				t.Fatalf("err=%v calls=%d wantCalls=%d", err, api.getCalls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestWaitForInstanceIPBoundsReadsAndSleeps(t *testing.T) {
+	for _, phase := range []string{"read", "sleep"} {
+		t.Run(phase, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				api := &fakeTencentCloudAPI{getFn: func(ctx context.Context, _ string) (instance, error) {
+					if phase == "read" {
+						select {
+						case <-ctx.Done():
+							return instance{}, ctx.Err()
+						case <-time.After(6 * time.Minute):
+							return instance{}, errors.New("unbounded read completed too late")
+						}
+					}
+					return instance{}, nil
+				}}
+				_, err := new(Backend).waitForInstanceIP(t.Context(), api, "ins-test")
+				if !errors.Is(err, context.DeadlineExceeded) || core.ExitCodeForError(err, 1) != 5 || err.Error() != "timed out waiting for Tencent Cloud instance IP" || time.Since(start) != 5*time.Minute || t.Context().Err() != nil {
+					t.Fatalf("err=%v code=%d elapsed=%v parent=%v", err, core.ExitCodeForError(err, 1), time.Since(start), t.Context().Err())
+				}
+			})
+		})
+	}
+}
+
+func TestWaitForInstanceIPRetainsObservationPolicy(t *testing.T) {
+	t.Run("public IP without running state after interval", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			reads := 0
+			api := &fakeTencentCloudAPI{getFn: func(context.Context, string) (instance, error) {
+				reads++
+				if reads == 1 {
+					return instance{PrivateIPAddresses: []string{"10.0.0.2"}}, nil
+				}
+				return instance{InstanceID: "ins-test", InstanceState: "STOPPED", PublicIPAddresses: []string{"203.0.113.25"}}, nil
+			}}
+			got, err := new(Backend).waitForInstanceIP(t.Context(), api, "ins-test")
+			if err != nil || got.InstanceID != "ins-test" || api.getCalls != 2 || time.Since(start) != 3*time.Second {
+				t.Fatalf("got=%#v err=%v calls=%d elapsed=%v", got, err, api.getCalls, time.Since(start))
+			}
+		})
+	})
+	for _, ready := range []bool{false, true} {
+		t.Run("completed response wins cancellation/ready="+strconv.FormatBool(ready), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			responseErr := errors.Join(&apiError{Code: "ResourceNotFound.Instance"}, context.Canceled)
+			api := &fakeTencentCloudAPI{getFn: func(context.Context, string) (instance, error) {
+				cancel()
+				if ready {
+					return instance{InstanceID: "ins-test", PublicIPAddresses: []string{"203.0.113.25"}}, nil
+				}
+				return instance{}, responseErr
+			}}
+			got, err := new(Backend).waitForInstanceIP(ctx, api, "ins-test")
+			if ready && (err != nil || got.InstanceID != "ins-test") || !ready && err != responseErr || api.getCalls != 1 {
+				t.Fatalf("got=%#v err=%v calls=%d", got, err, api.getCalls)
+			}
+		})
+	}
+	t.Run("independent client deadline stays unchanged", func(t *testing.T) {
+		api := &fakeTencentCloudAPI{getFn: func(context.Context, string) (instance, error) { return instance{}, context.DeadlineExceeded }}
+		_, err := new(Backend).waitForInstanceIP(t.Context(), api, "ins-test")
+		if err != context.DeadlineExceeded || api.getCalls != 1 {
+			t.Fatalf("err=%v calls=%d", err, api.getCalls)
+		}
+	})
+}
+
 func TestSignTencentCloudRequest(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://cvm.tencentcloudapi.com", strings.NewReader("{}"))
 	if err != nil {
@@ -623,6 +813,10 @@ func TestTencentCloudTerminationFencesConcurrentClaimMutation(t *testing.T) {
 }
 
 type fakeTencentCloudAPI struct {
+	runCalls        int
+	terminateErr    error
+	getCalls        int
+	getFn           func(context.Context, string) (instance, error)
 	item            instance
 	replacedCurrent []tag
 	replacedDesired []tag
@@ -640,11 +834,16 @@ func (f *fakeTencentCloudAPI) ListInstances(context.Context) ([]instance, error)
 	return []instance{f.item}, nil
 }
 
-func (f *fakeTencentCloudAPI) GetInstance(context.Context, string) (instance, error) {
+func (f *fakeTencentCloudAPI) GetInstance(ctx context.Context, id string) (instance, error) {
+	f.getCalls++
+	if f.getFn != nil {
+		return f.getFn(ctx, id)
+	}
 	return f.item, nil
 }
 
 func (f *fakeTencentCloudAPI) RunInstance(context.Context, runInstanceRequest) (string, error) {
+	f.runCalls++
 	return "ins-test", nil
 }
 
@@ -653,7 +852,7 @@ func (f *fakeTencentCloudAPI) TerminateInstance(_ context.Context, id string) er
 	if f.terminateFn != nil {
 		f.terminateFn()
 	}
-	return nil
+	return f.terminateErr
 }
 
 func (f *fakeTencentCloudAPI) ReplaceInstanceTags(_ context.Context, _ string, current, desired []tag) error {
