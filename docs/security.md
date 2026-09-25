@@ -396,10 +396,12 @@ require an exact same-origin browser `Origin` matching `CRABBOX_PUBLIC_URL` (or
 the request origin when no public URL is configured). Missing or sibling-origin
 intent is rejected before the portal cookie is converted into bearer authority;
 explicit bearer API clients remain independent of this browser-only boundary.
-The one-use WebVNC bootstrap POST is the narrow exception: it arrives from the
-CLI's file-origin bootstrap page without a Portal cookie and authorizes only by
-consuming the opaque, lease-bound ticket. Subsequent scoped-cookie mutations
-and viewer upgrades return to the exact same-origin requirement.
+The one-use WebVNC bootstrap POST is the narrow exception: it may arrive from
+the CLI's file-origin bootstrap page or another application's page, including
+with a viewer cookie left by an earlier open, and it authorizes only by
+consuming the opaque, lease-bound ticket, which also replaces that cookie.
+Subsequent scoped-cookie mutations and viewer upgrades return to the exact
+same-origin requirement.
 Portal logout follows the same boundary: `GET /portal/logout` only renders a
 confirmation page, and only a same-origin `POST` clears the portal cookie and
 revokes all WebVNC, Code, and mediated-egress bridges bound to that portal
