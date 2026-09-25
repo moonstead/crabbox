@@ -20,6 +20,7 @@ import {
   createUntrustedForwardingDiagnostic,
   drainAndStop,
   fleetRequestQueue,
+  forwardedRequestProtocol,
   isReadinessRequestMethod,
   isTrustedProxySource,
   nodeResponseHeaders,
@@ -251,7 +252,7 @@ function webRequestFromNode(
   signal?: AbortSignal,
 ): Request {
   const protocol = context.trustedProxy
-    ? firstHeader(request.headers["x-forwarded-proto"]) || "http"
+    ? forwardedRequestProtocol(firstHeader(request.headers["x-forwarded-proto"]))
     : "http";
   const forwardedHost = context.trustedProxy
     ? firstHeader(request.headers["x-forwarded-host"])

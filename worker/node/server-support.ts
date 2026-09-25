@@ -133,6 +133,16 @@ export function createUntrustedForwardingDiagnostic(
   };
 }
 
+// Reverse proxies such as Traefik label WebSocket requests ws or wss. Portal
+// origin checks compare against the public http(s) origin, so use the
+// matching HTTP scheme.
+export function forwardedRequestProtocol(value: string | undefined): string {
+  const protocol = value?.trim().toLowerCase() ?? "";
+  if (protocol === "wss") return "https";
+  if (protocol === "ws") return "http";
+  return protocol || "http";
+}
+
 export function requestSourceIP(
   peerAddress: string | undefined,
   forwardedFor: string | undefined,
