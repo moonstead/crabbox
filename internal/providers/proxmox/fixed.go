@@ -288,6 +288,9 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRe
 	}
 	kind := fixedProxmoxLeaseKind
 	if recoverPrepared {
+		// Settle in one claim write. A separate deleting record without a bound
+		// generation is a state that no stop, recovery or replay can settle.
+		kind.DeletionState = ""
 		kind.AfterTerminal = func(claim core.LeaseClaim) error {
 			return core.RemoveStoredTestboxConnectionArtifacts(claim.LeaseID)
 		}
@@ -306,6 +309,11 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRe
 			if candidate.CloudID == strconv.Itoa(vmid) || candidate.Labels["lease"] == leaseID || candidate.Labels["provider_key"] == core.ProviderKeyForLease(leaseID) {
 				return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s still has a surviving VM", leaseID)
 			}
+		}
+		// Every release persists the VMID before cloning, so an intent without
+		// one never sent a clone and has only its lease identity to check.
+		if vmid == 0 {
+			return nil
 		}
 		var present bool
 		if recoverPrepared {
@@ -341,7 +349,7 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRe
 			if err != nil {
 				return result, err
 			}
-			if vmid == 0 {
+			if vmid == 0 && !recoverPrepared {
 				return result, core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has no durable clone attempt", leaseID)
 			}
 			server, found, err := b.findFixedProxmoxServer(ctx, client, *claim)
@@ -401,6 +409,10 @@ func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRe
 }
 
 func validateFixedProxmoxTerminalClaim(claim core.LeaseClaim) error {
+	// A recovered intent that never reserved a VMID has no VM identity to retain.
+	if claim.CloudID == "" && claim.CloudNumericID == 0 && claim.CloudImmutableID == "" && len(claim.Labels) == 0 {
+		return nil
+	}
 	if claim.CloudID == "" || claim.CloudID != strconv.FormatInt(claim.CloudNumericID, 10) ||
 		claim.Labels["lease"] != claim.LeaseID || claim.Labels["provider"] != "proxmox" ||
 		claim.Labels["fixed_intent_sha256"] != claim.FixedCreateIntent.Fingerprint {
