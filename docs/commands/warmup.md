@@ -79,6 +79,27 @@ attempt so an interrupted operation can be safely replayed.
 - `--idle-timeout <duration>` releases the lease after no touch for that long.
   Default `30m`.
 
+`--keep=true` remains the default so the lease can be reused across runs. Set
+`warmup.keep: false` in user or repository config to change this default;
+`CRABBOX_WARMUP_KEEP` overrides config, and an explicit `--keep` wins over both.
+This setting applies only to `warmup`; it does not change `run --keep`.
+`lease.idleTimeout` (or top-level `idleTimeout`) configures the idle window;
+`CRABBOX_IDLE_TIMEOUT` overrides config and `--idle-timeout` overrides both.
+
+Managed coordinator leases expire automatically regardless of keep. New direct
+GCP VMs also honor recorded expiry through their guest-side expiry guard when
+the attached service account can delete the VM. The expiry is the earlier of
+TTL and idle timeout; GCP guests still marked running or provisioning retain
+the 12-hour stale-state grace period. Kept guests without valid expiry metadata
+are left alone.
+
+Manual `crabbox cleanup` always skips `keep=true` machines, including expired
+ones. It is separate from automatic expiry. For direct providers without an
+automatic idle reaper, use `warmup.keep: false` and schedule cleanup, or stop the
+lease explicitly. Existing GCP guests retain their installed guard; recreate
+them to receive the updated idle reaper. See [cleanup](cleanup.md) and the
+provider documentation for supported lifecycle behavior.
+
 Tenki is an exception: kept leases are sticky and ignore TTL, and native idle
 expiry is unsupported. Use `--keep=false` to pass TTL as Tenki's maximum duration,
 which pauses the sandbox when reached. Explicitly stop the lease to destroy it.
@@ -386,7 +407,7 @@ bootstrap, key migration, or failure cleanup.
 --tailscale-auth-key-env <env>     env var holding a direct-provider Tailscale auth key
 --tailscale-exit-node <name|100.x> Tailscale exit node
 --tailscale-exit-node-allow-lan-access
---keep                             keep the box after warmup; default true
+--keep                             retain across runs; recorded expiry still applies; default warmup.keep (true)
 --actions-runner                   register the box as an ephemeral GitHub Actions runner
 --reclaim                          overwrite an existing local claim for this lease
 --timing-json                      print a final JSON timing record on stderr

@@ -66,10 +66,11 @@ func TestShouldCleanupServerDeletesExpiredInactive(t *testing.T) {
 	}
 }
 
-func TestShouldCleanupServerKeepsUnexpiredAndKept(t *testing.T) {
+func TestShouldCleanupServerKeepsUnexpiredAndMissingExpiry(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	tests := []Server{
-		{Labels: map[string]string{"keep": "true", "expires_at": now.Add(-time.Hour).Format(time.RFC3339)}},
+		{Labels: map[string]string{"keep": "true", "expires_at": now.Add(time.Hour).Format(time.RFC3339)}},
+		{Labels: map[string]string{"keep": "true", "state": "released"}},
 		{Labels: map[string]string{"keep": "false", "expires_at": now.Add(time.Hour).Format(time.RFC3339)}},
 		{Labels: map[string]string{"keep": "false"}},
 	}
@@ -77,6 +78,25 @@ func TestShouldCleanupServerKeepsUnexpiredAndKept(t *testing.T) {
 		if ok, reason := shouldCleanupServer(server, now); ok {
 			t.Fatalf("shouldCleanupServer=%v, %s; want skip", ok, reason)
 		}
+	}
+}
+
+func TestShouldCleanupServerPreservesKeptExpiredLeases(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	for _, state := range []string{"ready", "leased", "active", "failed", "released", "expired", "running", "provisioning"} {
+		t.Run(state, func(t *testing.T) {
+			server := Server{Labels: map[string]string{
+				"keep": "true", "state": state,
+				"expires_at": now.Add(-24 * time.Hour).Format(time.RFC3339),
+			}}
+			if got, reason := shouldCleanupServer(server, now); got || reason != "keep=true" {
+				t.Fatalf("cleanup=%t (%s), want keep protection", got, reason)
+			}
+			server.Labels["expires_at"] = now.Add(time.Minute).Format(time.RFC3339)
+			if got, reason := shouldCleanupServer(server, now); got {
+				t.Fatalf("cleanup before expiry: %s", reason)
+			}
+		})
 	}
 }
 

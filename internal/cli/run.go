@@ -56,7 +56,7 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 	fs := newFlagSet("warmup", a.Stderr)
 	leaseFlags := registerLeaseCreateFlags(fs, defaults)
 	requestedLeaseID := fs.String("lease-id", "", "fixed lease ID for idempotent external-provider orchestration")
-	keep := fs.Bool("keep", true, "keep server after warmup")
+	keep := fs.Bool("keep", defaults.WarmupKeep, "retain server across runs; recorded idle/TTL expiry still applies (config: warmup.keep)")
 	actionsRunner := fs.Bool("actions-runner", false, "register this box as an ephemeral GitHub Actions runner")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
 	timingJSON := fs.Bool("timing-json", false, "print final timing as JSON")
@@ -72,6 +72,9 @@ func (a App) warmupWithLeaseObserver(ctx context.Context, args []string, observe
 		return err
 	}
 	markSynthesizedFlagInputs(&cfg, a.synthesizedFlagInputs)
+	if !flagWasSet(fs, "keep") {
+		*keep = cfg.WarmupKeep
+	}
 	if err := applyLeaseCreateFlags(&cfg, fs, leaseFlags); err != nil {
 		return err
 	}
@@ -1874,7 +1877,14 @@ func (a App) runCommandWithBenchmarkRecord(ctx context.Context, args []string, b
 			hydrateTarget.WindowsMode = cfg.WindowsMode
 		}
 		hydrateSupported := supportsLocalActionsHydrateTarget(hydrateTarget) || supportsGitHubActionsRunnerTarget(hydrateTarget)
-		preflightErr := printRemoteCapabilityPreflight(ctx, a.Stderr, cfg, server, currentTarget, leaseID, workdir, remoteRunEnvFiles(actionsEnvFile, profileEnvFile), hydratedByActions, actionsURL, hydrateSupported, envSelection.Inline)
+		preflightEnv := mergeEnv(nil, envSelection.Inline)
+		removeEnvironmentKeys(preflightEnv, reservedRunEnvNames...)
+		commandEnv, err := stageSSHCommandEnv(ctx, currentTarget, workdir, preflightEnv, a.Stderr)
+		if err != nil {
+			return err
+		}
+		defer commandEnv.close()
+		preflightErr := printRemoteCapabilityPreflight(ctx, a.Stderr, cfg, server, currentTarget, leaseID, workdir, remoteRunEnvFiles(actionsEnvFile, profileEnvFile, commandEnv.File), hydratedByActions, actionsURL, hydrateSupported, runExecutionMetadata(leaseID, executionRunID, ServerSlug(server)))
 		preflightPrinted = true
 		if preflightErr != nil {
 			return preflightErr
@@ -2839,8 +2849,14 @@ afterSync:
 		maybePrintEnvForwardingSummary(a.Stderr, cfg.Provider, "forwarded", cfg.EnvAllow, envSelection.Effective)
 	}
 	runEnv := mergeEnv(envSelection.Inline, capabilityEnv)
-	runEnv = mergeEnv(runEnv, runExecutionMetadata(leaseID, executionRunID, ServerSlug(server)))
-	envFiles := remoteRunEnvFiles(actionsEnvFile, profileEnvFile)
+	removeEnvironmentKeys(runEnv, reservedRunEnvNames...)
+	commandEnv, err := stageSSHCommandEnv(ctx, target, workdir, runEnv, a.Stderr)
+	if err != nil {
+		return recordFailure(err)
+	}
+	defer commandEnv.close()
+	runEnv = runExecutionMetadata(leaseID, executionRunID, ServerSlug(server))
+	envFiles := remoteRunEnvFiles(actionsEnvFile, profileEnvFile, commandEnv.File)
 	useShell := shouldUseShellWithLiteralArgs(command, expansion.LiteralArgs)
 	remote := remoteCommandWithEnvFiles(workdir, runEnv, envFiles, command)
 	if script != nil {
@@ -5123,6 +5139,10 @@ func (a App) stop(ctx context.Context, args []string) error {
 			fmt.Fprintf(a.Stderr, "warning: could not inspect lease before release: %v\n", err)
 			lease = LeaseTarget{LeaseID: *id, Server: Server{Provider: backend.Spec().Name}}
 		} else {
+			var missing *MissingLeaseClaimError
+			if !*forceRecovery && expectedIdentity.empty() && IsCanonicalLeaseID(*id) && errors.As(err, &missing) && missing.LeaseID == *id {
+				return Exit(1, "lease %s has no local claim; if an earlier stop verified absence, nothing remains to do; otherwise check the ID, provider, and provider inventory before recovery", *id)
+			}
 			return err
 		}
 	}

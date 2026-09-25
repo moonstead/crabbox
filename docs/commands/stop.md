@@ -17,6 +17,23 @@ crabbox stop --provider ssh --static-host mac-studio.local mac-studio.local
 
 `crabbox release` is a compatibility alias for `crabbox stop`.
 
+## Repeating a stop
+
+A repeated stop can exit 0 when the provider validates a retained terminal
+receipt for the exact canonical lease ID, as Incus does. Keep that receipt and
+the original provider configuration; a slug may now identify another live lease.
+
+Providers such as Boxd remove the local claim after verifying that the resource
+is absent. When the strict claim resolver identifies a missing canonical claim,
+ordinary CLI stop exits 1 with `lease <id> has no local claim`, rather than an
+identity-mismatch error. If the earlier stop reported verified absence, nothing remains to do.
+Without a claim or receipt, however, Crabbox cannot distinguish that replay from
+an unknown ID or lost local state and does not infer successful cleanup. Check
+the ID, selected provider, and provider inventory before attempting recovery.
+This missing-claim result performs no provider deletion. An existing claim with
+a conflicting ID, provider, or scope still fails as an identity mismatch.
+Other resolver callers retain their existing strict-mismatch error contract.
+
 ## Repository-scoped cleanup
 
 Ordinary `stop` is an administrative lease operation: changing the current
@@ -319,6 +336,13 @@ claim after authenticating its original account and verifying the requested
 name is absent from complete org-scoped inventory across a 30-second grace
 period. A matching name or any uncertain read retains the claim; recovery never
 adopts or deletes a machine by name. See [Boxd recovery](../providers/boxd.md#lifecycle-and-recovery).
+
+For Proxmox prepared fixed-ID claims without a bound VM generation,
+`stop --force --provider proxmox --id <canonical-cbx-id>` settles the claim only
+after verifying the original cluster/node scope, no active clone tasks, and
+complete cluster absence of the exact VMID, requested name, and lease identity.
+Inventory errors or a matching VM retain the claim. Recovery leaves a terminal
+receipt and never deletes a VM. See [Proxmox troubleshooting](../providers/proxmox.md#troubleshooting).
 
 `--reclaim` remains the existing provider-specific adoption interface where
 supported. `--force` is the consistent cross-provider recovery interface for

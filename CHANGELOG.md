@@ -3,10 +3,16 @@
 ## Unreleased
 
 - Keep background telemetry from replacing workspace command witnesses and failing successful hydration reads with exit 74. [PR 2563](https://github.com/openclaw/crabbox/pull/2563).
+- Remove Proxmox fixed-ID prepared claims after definite pre-allocation authorization rejections and add checked `stop --force` recovery for absent, unbound attempts. [Fixes #2559](https://github.com/openclaw/crabbox/issues/2559). Thanks @ahkohd.
 - Fix WSL2 static targets for non-administrator Windows accounts by removing WMI shell discovery and accepting read-only app-capability grants on HOME while preserving private stage ACLs. [Issue 2543](https://github.com/openclaw/crabbox/issues/2543), [PR 2546](https://github.com/openclaw/crabbox/pull/2546). Thanks @altaywtf.
 - Preserve the final Parallels VM-query error in IP timeouts and suppress stale DHCP or clone-mode advice when current inventory is unavailable. [PR 2480](https://github.com/openclaw/crabbox/pull/2480). Thanks @steipete.
 - Preserve Lambda acquisition causes when rollback fails, report recovery-claim write failures, and block automatic fresh-allocation retries after failed cleanup. [PR 2463](https://github.com/openclaw/crabbox/pull/2463). Thanks @steipete.
 - Bound Tencent Cloud IP-readiness reads and retry waits, preserve cancellation and acquisition causes after rollback failure, and prevent cleanup errors from triggering fresh-instance retries. [PR 2464](https://github.com/openclaw/crabbox/pull/2464). Thanks @steipete.
+- Honor recorded idle/TTL expiry for kept direct cloud warmups and add `warmup.keep` configuration without changing the retention default. Fixes [#2536](https://github.com/openclaw/crabbox/issues/2536). Thanks @youssef-tharwat.
+- Honor recorded idle/TTL expiry for kept GCP warmups through the guest expiry guard and add `warmup.keep` configuration, preserving the retention default and manual cleanup protection. Fixes [#2536](https://github.com/openclaw/crabbox/issues/2536). Thanks @youssef-tharwat.
+- Report missing local claims accurately when replaying stop after verified absence, retaining exit 1 without a terminal receipt and preserving genuine identity mismatch errors.
+- Report missing local claims accurately when replaying CLI stop after verified absence, retaining exit 1 without a terminal receipt and preserving provider resolver and genuine identity mismatch errors.
+- Keep allowlisted SSH environment values out of command lines and workspace-owner launchers by uploading private, temporary env files over stdin, including preflight, Windows/WSL2, and cache warm; refuse remote cleanup after workspace ownership renewal fails. Fixes #2535 (https://github.com/openclaw/crabbox/issues/2535). Thanks @youssef-tharwat for the report.
 - Join local Blacksmith sync descendants before an ordinary Testbox run returns after cancellation, preserving the lease claim until command cleanup completes. [PR 2547](https://github.com/openclaw/crabbox/pull/2547).
 - Stop Parallels IP discovery from admitting probes after the startup deadline while preserving the caller's cancellation cause. [PR 2548](https://github.com/openclaw/crabbox/pull/2548).
 

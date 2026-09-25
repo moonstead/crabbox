@@ -168,6 +168,9 @@ func ResolveProviderClaimStrict(identifier, provider, providerScope string) (cor
 	if err != nil {
 		return core.LeaseClaim{}, false, err
 	}
+	if !exact && !ok && core.IsCanonicalLeaseID(identifier) {
+		return core.LeaseClaim{}, false, &core.MissingLeaseClaimError{LeaseID: identifier, Err: ErrStrictClaimMismatch}
+	}
 	if (exact || core.IsCanonicalLeaseID(identifier)) && (!exact || !ok || claim.LeaseID != identifier) {
 		return core.LeaseClaim{}, false, ErrStrictClaimMismatch
 	}

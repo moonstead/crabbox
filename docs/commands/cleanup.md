@@ -84,7 +84,7 @@ What cleanup does depends on the selected provider:
 Selection is label-driven. Cleanup reads the `keep`, `state`, `expires_at`, and
 `ttl` labels written when the machine was created. The decision is conservative:
 
-- skip machines labeled `keep=true`;
+- skip machines labeled `keep=true`, even after recorded expiry;
 - for `running` or `provisioning` machines, skip until well past expiry — delete
   only once the expiry time plus a 12-hour stale window has elapsed;
 - for `leased`, `ready`, or `active` machines, delete once expired;

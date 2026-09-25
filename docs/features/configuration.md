@@ -120,6 +120,9 @@ workRoot: /srv/crabbox   # portable base root; not an exact command PWD
 lease:
   idleTimeout: 30m
   ttl: 90m
+
+warmup:
+  keep: true
 ```
 
 `broker.mode` defaults to `managed`. In `registered` mode, every direct SSH
@@ -134,6 +137,16 @@ invokes provider deletion. `CRABBOX_COORDINATOR_MODE` and
 default class is `beast`, the default TTL is `90m`, and the default idle
 timeout is `30m`. Setting `serverType` (or `--type` on the command line) pins
 that exact provider type and disables class fallback.
+
+`warmup.keep` defaults to `true` and supplies the `warmup --keep` default.
+An explicit `--keep=true` or `--keep=false` overrides `CRABBOX_WARMUP_KEEP`,
+which overrides repository config, user config, and the built-in default.
+It does not change `run --keep`. Managed coordinator expiry and new GCP guest
+expiry guards honor recorded idle/TTL expiry even for kept leases. Manual
+`crabbox cleanup` still skips kept machines. For a direct provider without an
+automatic idle reaper, set `warmup.keep: false` and schedule cleanup, or stop
+the lease explicitly. Provider-specific policies and running/provisioning grace
+periods still apply; see [warmup lifetime](../commands/warmup.md#lifetime-ttl-and-idle-timeout).
 
 ### Work roots
 
@@ -1218,6 +1231,7 @@ CRABBOX_PROFILE                 default profile
 CRABBOX_DEFAULT_CLASS           default machine class
 CRABBOX_SERVER_TYPE             explicit provider type
 CRABBOX_IDLE_TIMEOUT            idle timeout
+CRABBOX_WARMUP_KEEP             warmup retention default (true | false)
 CRABBOX_TTL                     lease TTL
 CRABBOX_NETWORK                 network mode
 CRABBOX_OWNER                   usage owner override
