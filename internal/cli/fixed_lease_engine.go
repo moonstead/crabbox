@@ -487,10 +487,12 @@ func (tx *FixedTransaction) FailedAttemptSet() map[string]bool {
 
 // RejectAttempt requires a provider-certified definite failure. Transport
 // uncertainty must never call this: it retains the current attempt instead.
-// The claim may carry only the identity this transaction's plan reserved.
+// The claim may carry only the identity this transaction's plan reserved, and
+// nothing may have been bound or observed since the submission was admitted.
 func (tx *FixedTransaction) RejectAttempt(kind FixedLeaseKind, token string, terminal bool) error {
 	intent := tx.Claim.FixedCreateIntent
 	if !kind.IsFixedClaim(*tx.Claim) || intent.Version != kind.IntentVersion || intent.State != "prepared" || token == "" ||
+		intent.Journal == nil || intent.Journal.Phase != "submitting" ||
 		tx.Claim.CloudID != tx.planned.CloudID || tx.Claim.CloudNumericID != tx.planned.NumericID || tx.Claim.CloudImmutableID != tx.planned.ImmutableID {
 		return Exit(4, "lease_id_conflict: cannot reject a bound or unidentified fixed attempt")
 	}

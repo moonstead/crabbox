@@ -280,3 +280,47 @@ func TestFixedEngineRejectsOnlyThisTransactionsPlannedIdentity(t *testing.T) {
 		t.Fatal("later rejection attempt changed the retained claim")
 	}
 }
+
+func TestFixedEngineRejectRequiresUnboundSubmission(t *testing.T) {
+	isolateTestUserDirs(t)
+	kind := FixedLeaseKind{ClaimProvider: "fixture-fixed", IntentVersion: 1, Label: "fixture", TerminalIdentityLabels: []string{"lease"}}
+	for name, publish := range map[string]func(*FixedTransaction) error{
+		// A native reply that repeats the planned identity is still evidence.
+		"bound":    func(tx *FixedTransaction) error { return tx.Bind(FixedResourceBinding{CloudID: "7", NumericID: 7}) },
+		"observed": func(tx *FixedTransaction) error { return tx.Observe(FixedResourceBinding{CloudID: "7"}) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			leaseID := "cbx_abcdef1234" + map[string]string{"bound": "21", "observed": "22"}[name]
+			rejected := errors.New("definite rejection")
+			ops := FixedLeaseOperations[string]{Admission: &FixedAdmission{FreshOnly: true},
+				DescribeIntent: func(context.Context, *LeaseClaim, bool) (FixedLeaseBinding, error) {
+					return FixedLeaseBinding{ProviderScope: "scope", Fingerprint: "hash", Slug: "fixture"}, nil
+				},
+				Plan: func(context.Context, LeaseClaim) (FixedAttemptPlan, error) {
+					return FixedAttemptPlan{Values: map[string]string{"id": "7"}, Labels: map[string]string{"lease": leaseID}, Identity: FixedResourceBinding{CloudID: "7", NumericID: 7}}, nil
+				},
+				ObserveExact: func(context.Context, *FixedTransaction, FixedObserveMode) (FixedObservation[string], error) {
+					return FixedObservation[string]{CanSubmit: true}, nil
+				},
+				Submit: func(_ context.Context, tx *FixedTransaction) (string, error) {
+					if err := publish(tx); err != nil {
+						t.Fatal(err)
+					}
+					if err := tx.RejectAttempt(kind, "7", true); err == nil || !strings.Contains(err.Error(), "cannot reject") {
+						t.Fatalf("published attempt rejected: %v", err)
+					}
+					return "", rejected
+				},
+				PrepareAccess: func(context.Context, *FixedTransaction, string) (LeaseTarget, error) {
+					return LeaseTarget{}, errors.New("unexpected access")
+				},
+			}
+			if _, err := AcquireFixedResource(t.Context(), FixedAcquireOptions{Kind: kind, LeaseID: leaseID, RepoRoot: "/fixture"}, ops); !errors.Is(err, rejected) {
+				t.Fatal(err)
+			}
+			if claim, _ := ReadLeaseClaim(leaseID); claim.FixedCreateIntent.State != "prepared" || claim.FixedCreateIntent.Attempt["id"] != "7" {
+				t.Fatalf("published attempt was not retained: %+v", claim)
+			}
+		})
+	}
+}
