@@ -537,6 +537,14 @@ propagated `VM.Audit` on `/vms`; missing permissions, unreadable inventory,
 active clones, or any matching VM retain the claim. Recovery never deletes a
 VM. Success removes the stored lease key and leaves a terminal receipt, freeing
 the VMID for a new lease ID while keeping the recovered fixed ID single-use.
+Recovery writes that receipt in one claim update, so an interruption leaves
+either the prepared claim or the receipt, never a partial deletion record.
+
+A prepared claim with no recorded VMID, such as one left when planning failed,
+never sent a clone: every Crabbox version with fixed IDs persists the VMID
+before cloning. Recovery checks only its lease label and provider key and leaves
+a receipt with no VM identity. Ordinary `stop` of any fixed receipt succeeds
+without changes, even after another lease reuses its VMID.
 
 `proxmox apiUrl is required` / `proxmox tokenId/tokenSecret are required` /
 `proxmox node is required` / `proxmox templateId is required`
