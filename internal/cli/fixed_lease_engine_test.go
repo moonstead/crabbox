@@ -198,3 +198,69 @@ func TestFixedEngineNeverResubmitsBoundClaim(t *testing.T) {
 		t.Fatal("rejected replacement changed custody")
 	}
 }
+
+func TestFixedEngineDefiniteRejectionRetiresOnlyUnallocatedAttempt(t *testing.T) {
+	for _, scenario := range []string{"observe", "plan", "submit", "bound", "access", "replay", "transport"} {
+		t.Run(scenario, func(t *testing.T) {
+			isolateTestUserDirs(t)
+			kind := FixedLeaseKind{ClaimProvider: "fixture-fixed", IntentVersion: 1, Label: "fixture"}
+			opts := FixedAcquireOptions{Kind: kind, LeaseID: "cbx_abcdef123405", RepoRoot: "/fixture"}
+			cause := errors.New("permission denied")
+			rejected := &FixedCreateRejected{Err: cause}
+			ops := FixedLeaseOperations[string]{
+				Admission: &FixedAdmission{},
+				DescribeIntent: func(context.Context, *LeaseClaim, bool) (FixedLeaseBinding, error) {
+					return FixedLeaseBinding{ProviderScope: "scope", Fingerprint: "hash", Slug: "fixture"}, nil
+				},
+				ObserveExact: func(context.Context, *FixedTransaction, FixedObserveMode) (FixedObservation[string], error) {
+					if scenario == "observe" {
+						return FixedObservation[string]{}, rejected
+					}
+					return FixedObservation[string]{CanSubmit: true}, nil
+				},
+				Plan: func(context.Context, LeaseClaim) (FixedAttemptPlan, error) {
+					if scenario == "plan" {
+						return FixedAttemptPlan{}, rejected
+					}
+					return FixedAttemptPlan{Values: map[string]string{"id": "reserved"}, Identity: FixedResourceBinding{CloudID: "reserved"}}, nil
+				},
+				Submit: func(_ context.Context, tx *FixedTransaction) (string, error) {
+					if scenario == "transport" || scenario == "replay" {
+						return "", cause
+					}
+					if scenario == "bound" {
+						if err := tx.Bind(FixedResourceBinding{CloudID: "reserved"}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if scenario == "access" {
+						return "reserved", nil
+					}
+					return "", rejected
+				},
+				PrepareAccess: func(context.Context, *FixedTransaction, string) (LeaseTarget, error) {
+					return LeaseTarget{}, rejected
+				},
+			}
+			_, err := AcquireFixedResource(t.Context(), opts, ops)
+			if !errors.Is(err, cause) {
+				t.Fatalf("lost native diagnostic: %v", err)
+			}
+			claim, exists, readErr := ReadLeaseClaimWithPresence(opts.LeaseID)
+			wantRetained := scenario == "bound" || scenario == "access" || scenario == "transport" || scenario == "replay"
+			if readErr != nil || exists != wantRetained {
+				t.Fatalf("claim retained=%t want=%t err=%v", exists, wantRetained, readErr)
+			}
+			if scenario == "replay" {
+				ops.ObserveExact = func(context.Context, *FixedTransaction, FixedObserveMode) (FixedObservation[string], error) {
+					return FixedObservation[string]{}, rejected
+				}
+				_, err := AcquireFixedResource(t.Context(), opts, ops)
+				after, exists, readErr := ReadLeaseClaimWithPresence(opts.LeaseID)
+				if !errors.Is(err, cause) || readErr != nil || !exists || !reflect.DeepEqual(claim, after) {
+					t.Fatalf("replay rejection lost custody: %v %v", err, readErr)
+				}
+			}
+		})
+	}
+}

@@ -399,7 +399,9 @@ can be stopped safely; replay does not declare it ready merely because SSH works
 
 Successful fixed-ID release, including authoritative absence of a previously
 acquired VM, retains a terminal local tombstone. Absence while a clone is still
-uncertain does not prove completion and retains the attempt. Checked deletion
+uncertain does not prove completion and retains the attempt on ordinary stop.
+Explicit prepared-claim recovery checks both cluster absence and active clone
+tasks as described below. Checked deletion
 records its phase before stopping/purging, so a retry can reconcile a lost delete
 response without reopening acquisition. The fixed lease ID is single-use and
 cannot allocate another VM after release.
@@ -434,6 +436,39 @@ VMID-based purge has no atomic identity precondition; do not concurrently replac
 VMs through raw Proxmox operations while cleanup runs.
 
 ## Troubleshooting
+
+`http 403: Permission check failed (..., SDN.Use)` during a fixed-ID clone
+
+Grant the API token the named permission on the indicated resource (for example,
+`SDN.Use` on the selected bridge), then retry the same `warmup --lease-id` request.
+A definite HTTP 401/403 rejection from the clone endpoint, or an authorization
+failure during inventory/planning before submission, removes the pending intent
+and generated lease key. It does not reserve the VMID or consume the fixed ID.
+The original API error preserves the missing permission and path.
+
+A 401/403 from task polling or VM identity reads after clone acceptance is
+ambiguous: the VM may already exist. Crabbox retains the prepared claim and
+refuses another clone. Restore read permissions and inspect the clone task and
+VM before recovery. A bound generation can be released with ordinary `stop`;
+an existing VM without a bound generation requires manual inspection and cannot
+be adopted or deleted by name.
+
+For an older prepared claim left by a rejected clone, or an inspected attempt
+whose VM is absent, use:
+
+```sh
+crabbox stop --force --provider proxmox --id cbx_123456abcdef
+```
+
+Recovery requires the original cluster/node scope, a canonical fixed lease ID,
+and a prepared claim with no bound generation. Under the claim lock it verifies
+there are no active `qmclone` tasks on the source node, then checks complete
+cluster inventory for the reserved VMID, exact requested VM name, lease label,
+and provider key. This requires `Sys.Audit` on `/nodes/<source-node>` and
+propagated `VM.Audit` on `/vms`; missing permissions, unreadable inventory,
+active clones, or any matching VM retain the claim. Recovery never deletes a
+VM. Success removes the stored lease key and leaves a terminal receipt, freeing
+the VMID for a new lease ID while keeping the recovered fixed ID single-use.
 
 `proxmox apiUrl is required` / `proxmox tokenId/tokenSecret are required` /
 `proxmox node is required` / `proxmox templateId is required`

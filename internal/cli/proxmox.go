@@ -983,6 +983,43 @@ func (c *ProxmoxClient) GetServerOnNode(ctx context.Context, node, id string) (S
 }
 
 func (c *ProxmoxClient) VMExistsInCluster(ctx context.Context, id string) (bool, error) {
+	return c.vmIdentityExistsInCluster(ctx, id, "")
+}
+
+// VMIdentityExistsInCluster includes unlabelled VMs and other guest types.
+// Complete visibility is required: a filtered list is not absence evidence.
+func (c *ProxmoxClient) VMIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
+	if strings.TrimSpace(name) == "" {
+		return false, fmt.Errorf("Proxmox VM name is required for identity absence")
+	}
+	if err := c.requirePropagatedVMAudit(ctx, "/vms"); err != nil {
+		return false, err
+	}
+	return c.vmIdentityExistsInCluster(ctx, id, name)
+}
+
+// VerifyNoActiveCloneTasks fences absence recovery against a clone that has
+// been accepted but has not published its VM in cluster inventory yet.
+func (c *ProxmoxClient) VerifyNoActiveCloneTasks(ctx context.Context) error {
+	path := "/nodes/" + c.Node
+	var permissions map[string]map[string]proxmoxInt
+	if err := c.doRequired(ctx, http.MethodGet, "/access/permissions?path="+url.QueryEscape(path), nil, &permissions); err != nil {
+		return err
+	}
+	if _, ok := permissions[path]["Sys.Audit"]; !ok {
+		return fmt.Errorf("permission denied: Proxmox prepared-claim recovery requires Sys.Audit on %s to inspect all active clone tasks", path)
+	}
+	var tasks []json.RawMessage
+	if err := c.doRequired(ctx, http.MethodGet, "/nodes/"+url.PathEscape(c.Node)+"/tasks?source=active&typefilter=qmclone&limit=1", nil, &tasks); err != nil {
+		return err
+	}
+	if len(tasks) != 0 {
+		return fmt.Errorf("Proxmox clone task is still active on %s; wait for completion before prepared-claim recovery", c.Node)
+	}
+	return nil
+}
+
+func (c *ProxmoxClient) vmIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
 	vmid, err := strconv.Atoi(strings.TrimSpace(id))
 	if err != nil || vmid <= 0 {
 		return false, fmt.Errorf("invalid Proxmox VM identity %q", id)
@@ -995,7 +1032,7 @@ func (c *ProxmoxClient) VMExistsInCluster(ctx context.Context, id string) (bool,
 		return false, err
 	}
 	for _, vm := range vms {
-		if int(vm.VMID) == vmid {
+		if int(vm.VMID) == vmid || name != "" && vm.Name == name {
 			return true, nil
 		}
 	}
