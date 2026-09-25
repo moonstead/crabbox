@@ -414,6 +414,14 @@ existing ordinary-stop contract. Report `ReleaseLeaseOutcome.ForgottenLocally`
 when an adapter's release entry point delegates to this transaction, so core
 skips release cleanup and reports local forgetting distinctly.
 
+Fixed-lease adapters can return `core.FixedCreateRejected` from pre-submit
+observation/planning or submission only when the native failure proves no
+allocation occurred. Core removes the first unallocated intent under its claim
+lock, including a pre-reserved resource ID, and preserves the native diagnostic.
+It retains earlier attempts, published bindings, and access failures. Classify
+the exact allocating endpoint in the adapter: an authorization error from a
+later task or identity read is not a definite create rejection.
+
 Use `shared.RemoveExactClaimAfterContext` for exact-claim terminal cleanup and
 pass the same lifecycle context that its provider action uses. There is no
 implicit background-context variant: waiting for the claim fence must honor the

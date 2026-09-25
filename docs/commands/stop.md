@@ -320,6 +320,13 @@ name is absent from complete org-scoped inventory across a 30-second grace
 period. A matching name or any uncertain read retains the claim; recovery never
 adopts or deletes a machine by name. See [Boxd recovery](../providers/boxd.md#lifecycle-and-recovery).
 
+For Proxmox prepared fixed-ID claims without a bound VM generation,
+`stop --force --provider proxmox --id <canonical-cbx-id>` settles the claim only
+after verifying the original cluster/node scope, no active clone tasks, and
+complete cluster absence of the exact VMID, requested name, and lease identity.
+Inventory errors or a matching VM retain the claim. Recovery leaves a terminal
+receipt and never deletes a VM. See [Proxmox troubleshooting](../providers/proxmox.md#troubleshooting).
+
 `--reclaim` remains the existing provider-specific adoption interface where
 supported. `--force` is the consistent cross-provider recovery interface for
 one exact resource: it reuses verified adoption for supported direct providers

@@ -27,6 +27,8 @@ type proxmoxClient interface {
 	GetServer(context.Context, string) (core.Server, error)
 	GetServerOnNode(context.Context, string, string) (core.Server, error)
 	VMExistsInCluster(context.Context, string) (bool, error)
+	VMIdentityExistsInCluster(context.Context, string, string) (bool, error)
+	VerifyNoActiveCloneTasks(context.Context) error
 	DeleteServer(context.Context, string) error
 	DeleteServerOnNode(context.Context, string, string) error
 	DeleteServerOnNodeChecked(context.Context, string, string, func(core.Server) error) error
@@ -370,7 +372,7 @@ func (b *leaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.Rel
 		if label := proxmoxClaimLabelLeaseID(req.Lease.Server); label != "" && label != leaseID {
 			return core.ReleaseLeaseOutcome{}, core.Exit(4, "lease_id_conflict: fixed Proxmox release lease label %s does not match %s", label, leaseID)
 		}
-		err := b.releaseFixed(ctx, req, false)
+		err := b.releaseFixed(ctx, req, false, false)
 		return core.ReleaseLeaseOutcome{Terminal: err == nil}, err
 	}
 	if req.Lease.Server.Labels["fixed_intent_sha256"] != "" || exists && claim.Provider == core.FixedProxmoxClaimProvider {
@@ -489,7 +491,7 @@ func (b *leaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) err
 				fmt.Fprintf(b.RT.Stderr, "would delete server id=%s name=%s\n", server.DisplayID(), server.Name)
 				continue
 			}
-			if err := b.releaseFixed(ctx, core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: fixedClaim.LeaseID, Server: server}}, true); err != nil {
+			if err := b.releaseFixed(ctx, core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: fixedClaim.LeaseID, Server: server}}, true, false); err != nil {
 				return err
 			}
 			fmt.Fprintf(b.RT.Stderr, "delete server id=%s name=%s fixed=true key_retained=true\n", server.DisplayID(), server.Name)
