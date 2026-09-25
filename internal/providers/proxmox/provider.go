@@ -27,7 +27,7 @@ func (Provider) Spec() core.ProviderSpec {
 		Family:           "proxmox",
 		Kind:             core.ProviderKindSSHLease,
 		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureClaimExec, core.FeatureCrabboxSync, core.FeatureCleanup},
 		Coordinator:      core.CoordinatorNever,
 		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}

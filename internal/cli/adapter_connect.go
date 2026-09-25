@@ -30,6 +30,12 @@ const (
 	adapterRelayMaxBackoff            = 5 * time.Second
 	adapterRelayMaxConcurrentRequests = 64
 	adapterRelayMaxConcurrentDeletes  = 8
+	// Workspace exec is opt-in. Its body carries private stdin, so it has its
+	// own bound and lane, and a timeout covering the command plus SSH setup.
+	adapterRelayMaxExecBodyBytes    = controllerExecMaxBodyBytes
+	adapterRelayMaxExecMessageBytes = adapterRelayMaxExecBodyBytes*6 + (16 << 10)
+	adapterRelayExecOverhead        = 30 * time.Second
+	adapterRelayMaxConcurrentExecs  = 4
 )
 
 type coordinatorAdapterTicket struct {
@@ -61,8 +67,12 @@ type adapterRelay struct {
 	loadLocalToken func() (string, error)
 	client         *http.Client
 	desktopTimeout time.Duration
-	ws             *websocket.Conn
-	writeMu        sync.Mutex
+	// execTimeout is zero unless this connector relays workspace exec.
+	execTimeout time.Duration
+	ws          *websocket.Conn
+	writeMu     sync.Mutex
+	inflightMu  sync.Mutex
+	inflight    map[string]context.CancelFunc
 }
 
 func (a App) adapterConnect(ctx context.Context, args []string) error {
@@ -74,11 +84,13 @@ func (a App) adapterConnect(ctx context.Context, args []string) error {
 	localSocket := fs.String("local-socket", getenv("CRABBOX_ADAPTER_LOCAL_SOCKET", ""), "current-user-owned local adapter Unix socket (required)")
 	tokenFile := fs.String("token-file", getenv("CRABBOX_ADAPTER_TOKEN_FILE", ""), "file containing the local adapter bearer token (required)")
 	connectionTimeout := fs.Duration("connection-timeout", controllerEnvDuration("CRABBOX_ADAPTER_CONNECTION_TIMEOUT", adapterRelayDefaultConnectionTime), "local adapter desktop connection setup duration")
+	allowExec := fs.Bool("allow-exec", controllerEnvBool("CRABBOX_ADAPTER_ALLOW_EXEC"), "relay workspace exec requests to the local adapter")
+	execTimeout := fs.Duration("exec-timeout", controllerEnvDuration("CRABBOX_ADAPTER_EXEC_TIMEOUT", controllerExecDefaultMaxTimeout), "local adapter workspace exec duration; match adapter serve --exec-max-timeout")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return Exit(2, "usage: crabbox adapter connect --id <adapter-id> --local-socket <path> --token-file <path> [--connection-timeout <duration>]")
+		return Exit(2, "usage: crabbox adapter connect --id <adapter-id> --local-socket <path> --token-file <path> [--connection-timeout <duration>] [--allow-exec [--exec-timeout <duration>]]")
 	}
 	adapterID := strings.TrimSpace(*id)
 	if !validControllerWorkspaceID(adapterID) {
@@ -97,6 +109,13 @@ func (a App) adapterConnect(ctx context.Context, args []string) error {
 	if desktopRequestTimeout <= *connectionTimeout {
 		return Exit(2, "--connection-timeout is too large")
 	}
+	execRequestTimeout := time.Duration(0)
+	if *allowExec {
+		if *execTimeout < controllerExecMinTimeout || *execTimeout > controllerExecMaximumTimeout {
+			return Exit(2, "--exec-timeout must be between %s and %s", controllerExecMinTimeout, controllerExecMaximumTimeout)
+		}
+		execRequestTimeout = *execTimeout + adapterRelayExecOverhead
+	}
 	socketPath, err := normalizeAdapterUnixSocketPath(strings.TrimSpace(*localSocket))
 	if err != nil {
 		return Exit(2, "--local-socket: %v", err)
@@ -107,7 +126,7 @@ func (a App) adapterConnect(ctx context.Context, args []string) error {
 	if _, err := loadLocalToken(); err != nil {
 		return err
 	}
-	localClient, err := newAdapterLocalClient(socketPath, desktopRequestTimeout)
+	localClient, err := newAdapterLocalClient(socketPath, max(desktopRequestTimeout, execRequestTimeout))
 	if err != nil {
 		return Exit(2, "--local-socket: %v", err)
 	}
@@ -127,7 +146,7 @@ func (a App) adapterConnect(ctx context.Context, args []string) error {
 		if _, err := loadLocalToken(); err != nil {
 			return err
 		}
-		return connectAdapterRelay(connectCtx, coord, adapterID, "http://adapter.local", socketPath, loadLocalToken, localClient, desktopRequestTimeout, a.Stdout)
+		return connectAdapterRelay(connectCtx, coord, adapterID, "http://adapter.local", socketPath, loadLocalToken, localClient, desktopRequestTimeout, execRequestTimeout, a.Stdout)
 	})
 }
 
@@ -198,6 +217,7 @@ func connectAdapterRelay(
 	loadLocalToken func() (string, error),
 	localClient *http.Client,
 	desktopRequestTimeout time.Duration,
+	execRequestTimeout time.Duration,
 	status io.Writer,
 ) error {
 	dialCtx, cancelDial := context.WithTimeout(ctx, adapterRelayHandshakeTimeout)
@@ -206,7 +226,13 @@ func connectAdapterRelay(
 	if coordinatorDesktopTimeout <= desktopRequestTimeout {
 		return errors.New("adapter relay desktop timeout is too large")
 	}
-	ticket, err := coord.CreateAdapterTicket(dialCtx, adapterID, coordinatorDesktopTimeout)
+	// Advertising an exec budget is this connector's opt-in; a coordinator
+	// never relays exec to a connector that did not advertise one.
+	coordinatorExecTimeout := time.Duration(0)
+	if execRequestTimeout > 0 {
+		coordinatorExecTimeout = execRequestTimeout + adapterRelayWriteTimeout
+	}
+	ticket, err := coord.CreateAdapterTicket(dialCtx, adapterID, coordinatorDesktopTimeout, coordinatorExecTimeout)
 	if err != nil {
 		return fmt.Errorf("create adapter ticket: %w", err)
 	}
@@ -228,13 +254,19 @@ func connectAdapterRelay(
 		}
 		return fmt.Errorf("connect adapter relay: %w", err)
 	}
-	ws.SetReadLimit(adapterRelayMaxMessageBytes)
+	readLimit := int64(adapterRelayMaxMessageBytes)
+	if execRequestTimeout > 0 {
+		readLimit = adapterRelayMaxExecMessageBytes
+	}
+	ws.SetReadLimit(readLimit)
 	relay := &adapterRelay{
 		localBaseURL:   localBaseURL,
 		loadLocalToken: loadLocalToken,
 		client:         localClient,
 		desktopTimeout: desktopRequestTimeout,
+		execTimeout:    execRequestTimeout,
 		ws:             ws,
+		inflight:       map[string]context.CancelFunc{},
 	}
 	defer ws.Close(websocket.StatusNormalClosure, "adapter relay stopped")
 	if status != nil {
@@ -243,11 +275,15 @@ func connectAdapterRelay(
 	return relay.serve(ctx)
 }
 
-func (c *CoordinatorClient) CreateAdapterTicket(ctx context.Context, adapterID string, desktopTimeout time.Duration) (coordinatorAdapterTicket, error) {
+func (c *CoordinatorClient) CreateAdapterTicket(ctx context.Context, adapterID string, desktopTimeout, execTimeout time.Duration) (coordinatorAdapterTicket, error) {
 	var result coordinatorAdapterTicket
-	err := c.do(ctx, http.MethodPost, "/v1/adapters/"+url.PathEscape(adapterID)+"/ticket", map[string]any{
+	body := map[string]any{
 		"desktopTimeoutMs": desktopTimeout.Milliseconds(),
-	}, &result)
+	}
+	if execTimeout > 0 {
+		body["execTimeoutMs"] = execTimeout.Milliseconds()
+	}
+	err := c.do(ctx, http.MethodPost, "/v1/adapters/"+url.PathEscape(adapterID)+"/ticket", body, &result)
 	return result, err
 }
 
@@ -271,6 +307,7 @@ func (r *adapterRelay) serve(ctx context.Context) error {
 	relayCtx, cancel := context.WithCancelCause(ctx)
 	requests := make(chan struct{}, adapterRelayMaxConcurrentRequests)
 	deletes := make(chan struct{}, adapterRelayMaxConcurrentDeletes)
+	execs := make(chan struct{}, adapterRelayMaxConcurrentExecs)
 	var workers sync.WaitGroup
 	defer func() {
 		cancel(context.Canceled)
@@ -291,19 +328,41 @@ func (r *adapterRelay) serve(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("decode adapter relay request: %w", err)
 		}
+		if request.Type == "cancel" {
+			// The coordinator withdrew a request whose caller went away or whose
+			// deadline passed. Unknown IDs have already finished.
+			if r.execTimeout > 0 && validAdapterRelayRequestID(request.ID) {
+				r.cancelInflight(request.ID)
+			}
+			continue
+		}
 		limit := requests
 		if request.Method == http.MethodDelete {
 			// Keep cancellation available even while slow desktop setup requests
 			// occupy every ordinary relay slot.
 			limit = deletes
+		} else if adapterRelayExecPath(request.Method, request.Path) {
+			limit = execs
 		}
 		select {
 		case limit <- struct{}{}:
+			requestCtx, cancelRequest := context.WithCancel(relayCtx)
+			if !r.trackInflight(request.ID, cancelRequest) {
+				cancelRequest()
+				<-limit
+				response := adapterRelayErrorResponse(request.ID, http.StatusConflict, "duplicate_request", "adapter relay request id is already in flight")
+				if err := r.writeResponse(relayCtx, response); err != nil {
+					cancel(err)
+					return err
+				}
+				continue
+			}
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
 				defer func() { <-limit }()
-				response := r.handle(relayCtx, request)
+				defer r.finishInflight(request.ID, cancelRequest)
+				response := r.handle(requestCtx, request)
 				if err := r.writeResponse(relayCtx, response); err != nil {
 					cancel(err)
 				}
@@ -346,8 +405,34 @@ func decodeAdapterRelayRequest(data []byte) (adapterRelayRequest, error) {
 	return request, nil
 }
 
+func (r *adapterRelay) trackInflight(id string, cancel context.CancelFunc) bool {
+	r.inflightMu.Lock()
+	defer r.inflightMu.Unlock()
+	if _, exists := r.inflight[id]; exists {
+		return false
+	}
+	r.inflight[id] = cancel
+	return true
+}
+
+func (r *adapterRelay) finishInflight(id string, cancel context.CancelFunc) {
+	cancel()
+	r.inflightMu.Lock()
+	delete(r.inflight, id)
+	r.inflightMu.Unlock()
+}
+
+func (r *adapterRelay) cancelInflight(id string) {
+	r.inflightMu.Lock()
+	cancel := r.inflight[id]
+	r.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (r *adapterRelay) handle(ctx context.Context, request adapterRelayRequest) adapterRelayResponse {
-	if err := validateAdapterRelayRequest(request); err != nil {
+	if err := validateAdapterRelayRequestWithExec(request, r.execTimeout > 0); err != nil {
 		return adapterRelayErrorResponse(request.ID, http.StatusBadRequest, "invalid_request", err.Error())
 	}
 	deadline := time.UnixMilli(request.DeadlineMS)
@@ -360,9 +445,12 @@ func (r *adapterRelay) handle(ctx context.Context, request adapterRelayRequest) 
 	}
 	deadlineCtx, cancelDeadline := context.WithDeadline(ctx, deadline)
 	defer cancelDeadline()
-	requestCtx, cancelTimeout := context.WithTimeout(deadlineCtx, adapterRelayTimeoutForRequest(request, r.desktopTimeout))
+	requestCtx, cancelTimeout := context.WithTimeout(deadlineCtx, adapterRelayTimeout(request, r.desktopTimeout, r.execTimeout))
 	defer cancelTimeout()
 	localPath, ok := adapterRelayCanonicalPath(request.Method, request.Path)
+	if r.execTimeout > 0 && adapterRelayExecPath(request.Method, request.Path) {
+		localPath, ok = request.Path, true
+	}
 	if !ok {
 		return adapterRelayErrorResponse(request.ID, http.StatusBadRequest, "invalid_request", "method and path are outside the crabfleet/v1 adapter surface")
 	}
@@ -386,7 +474,7 @@ func (r *adapterRelay) handle(ctx context.Context, request adapterRelayRequest) 
 	}
 	localRequest.Header.Set("Authorization", "Bearer "+localToken)
 	localRequest.Header.Set("Accept", "application/json")
-	if request.Method == http.MethodPost && request.Path == "/v1/workspaces" && localRequest.Header.Get("Content-Type") == "" {
+	if request.Method == http.MethodPost && (request.Path == "/v1/workspaces" || adapterRelayExecPath(request.Method, request.Path)) && localRequest.Header.Get("Content-Type") == "" {
 		localRequest.Header.Set("Content-Type", "application/json")
 	}
 	if requestCtx.Err() != nil {
@@ -417,6 +505,13 @@ func (r *adapterRelay) handle(ctx context.Context, request adapterRelayRequest) 
 	return response
 }
 
+func adapterRelayTimeout(request adapterRelayRequest, desktopTimeout, execTimeout time.Duration) time.Duration {
+	if execTimeout > 0 && adapterRelayExecPath(request.Method, request.Path) {
+		return execTimeout
+	}
+	return adapterRelayTimeoutForRequest(request, desktopTimeout)
+}
+
 func adapterRelayTimeoutForRequest(request adapterRelayRequest, desktopTimeout time.Duration) time.Duration {
 	if request.Method == http.MethodPost && (strings.HasSuffix(request.Path, "/connections/desktop") || strings.HasSuffix(request.Path, "/connections/native-vnc")) {
 		if desktopTimeout <= 0 {
@@ -428,6 +523,10 @@ func adapterRelayTimeoutForRequest(request adapterRelayRequest, desktopTimeout t
 }
 
 func validateAdapterRelayRequest(request adapterRelayRequest) error {
+	return validateAdapterRelayRequestWithExec(request, false)
+}
+
+func validateAdapterRelayRequestWithExec(request adapterRelayRequest, allowExec bool) error {
 	if request.Type != "request" {
 		return errors.New("type must be request")
 	}
@@ -436,6 +535,15 @@ func validateAdapterRelayRequest(request adapterRelayRequest) error {
 	}
 	if request.DeadlineMS <= 0 {
 		return errors.New("deadlineMs must be a positive Unix millisecond timestamp")
+	}
+	if adapterRelayExecPath(request.Method, request.Path) {
+		if !allowExec {
+			return errors.New("workspace exec is not enabled on this adapter relay")
+		}
+		if err := validateAdapterRelayExecBody(request.Body); err != nil {
+			return err
+		}
+		return validateAdapterRelayHeaders(request.Headers)
 	}
 	if request.Method != strings.ToUpper(request.Method) || !adapterRelayRouteAllowed(request.Method, request.Path) {
 		return errors.New("method and path are outside the crabfleet/v1 adapter surface")
@@ -465,6 +573,38 @@ func validAdapterRelayRequestID(value string) bool {
 		}
 	}
 	return true
+}
+
+// adapterRelayExecPath reports POST /v1/workspaces/{id}/exec. It is kept out
+// of adapterRelayCanonicalPath so the ordinary surface stays unchanged.
+func adapterRelayExecPath(method, requestPath string) bool {
+	const prefix, suffix = "/v1/workspaces/", "/exec"
+	if method != http.MethodPost || !strings.HasPrefix(requestPath, prefix) || !strings.HasSuffix(requestPath, suffix) || strings.ContainsAny(requestPath, "?#%") {
+		return false
+	}
+	return validControllerWorkspaceID(strings.TrimSuffix(strings.TrimPrefix(requestPath, prefix), suffix))
+}
+
+// validateAdapterRelayExecBody requires the coordinator's execution-time
+// binding. The body also carries private stdin: never quote it in errors.
+func validateAdapterRelayExecBody(body *string) error {
+	if body == nil || *body == "" {
+		return errors.New("workspace exec requires a request body")
+	}
+	if len(*body) > adapterRelayMaxExecBodyBytes {
+		return errors.New("workspace exec body exceeds its limit")
+	}
+	var binding struct {
+		LeaseID        string `json:"leaseId"`
+		RegistrationID string `json:"registrationId"`
+	}
+	if json.Unmarshal([]byte(*body), &binding) != nil {
+		return errors.New("workspace exec body must be a JSON object")
+	}
+	if !IsCanonicalLeaseID(binding.LeaseID) || !validControllerWorkspaceID(binding.RegistrationID) {
+		return errors.New("workspace exec requires the coordinator's lease and registration binding")
+	}
+	return nil
 }
 
 func adapterRelayRouteAllowed(method, requestPath string) bool {

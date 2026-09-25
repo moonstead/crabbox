@@ -404,6 +404,25 @@ records its phase before stopping/purging, so a retry can reconcile a lost delet
 response without reopening acquisition. The fixed lease ID is single-use and
 cannot allocate another VM after release.
 
+### Claim-fenced exec
+
+Proxmox advertises `claim-exec`, so [`crabbox exec`](../commands/exec.md) can
+run a command on a completed fixed-ID lease without syncing a checkout. Before
+opening SSH, the provider requires an acquired fixed claim in the current
+cluster scope and exactly one live VM whose VMID, `vmgenid`, lease labels,
+intent fingerprint and source node match that claim. The VM must be `ready`
+and unexpired and have a guest address, and its readiness check must pass over
+SSH; like acquisition, that probe selects the working SSH port. Ordinary leases
+and unfinished or released fixed attempts are rejected; use `run` for ordinary
+leases.
+
+The command uses the stored per-lease SSH key and Crabbox's private SSH
+transport. No Proxmox or SSH credential leaves the host running Crabbox. Exec
+does not renew idle activity; the lease's TTL and idle expiry still apply.
+Fixed-ID release takes the exclusive claim fence that exec holds shared, so a
+VM cannot be deleted while a command is running. A runtime adapter can offer
+this through its opt-in [workspace exec](../features/runtime-adapter-exec.md).
+
 ### Automatic cleanup ownership
 
 Cleanup requires exactly one local claim matching the provider, configured API

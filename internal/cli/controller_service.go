@@ -40,6 +40,8 @@ type controllerCapabilities struct {
 	Desktop bool `json:"desktop"`
 	Browser bool `json:"browser"`
 	Code    bool `json:"code"`
+	// Exec opts this workspace into the adapter's authorised command execution.
+	Exec bool `json:"exec,omitempty"`
 }
 
 type controllerWorkspaceResponseCapabilities struct {
@@ -49,6 +51,7 @@ type controllerWorkspaceResponseCapabilities struct {
 	Desktop   bool `json:"desktop"`
 	Logs      bool `json:"logs"`
 	Artifacts bool `json:"artifacts"`
+	Exec      bool `json:"exec,omitempty"`
 }
 
 type controllerWorkspaceRequest struct {
@@ -149,6 +152,9 @@ type controllerServiceOptions struct {
 	RequiredIdleSeconds      int
 	ForbidClassOverride      bool
 	ForbidServerTypeOverride bool
+	// ExecAllow lists operator-authorised argv prefixes; empty disables exec.
+	ExecAllow      [][]string
+	ExecMaxTimeout time.Duration
 }
 
 type controllerWorkspaceRunner interface {
@@ -197,6 +203,8 @@ type controllerService struct {
 	createOps          map[string]*controllerCreateOperation
 	reconcileTimers    map[string]*controllerReconcileTimer
 	connectionSlots    map[string]chan struct{}
+	execSlots          map[string]chan struct{}
+	execSem            chan struct{}
 	localCleanupRetry  map[string]struct{}
 	terminalRevocation map[string]controllerTerminalRevocation
 	desktopSetups      chan struct{}
@@ -228,6 +236,7 @@ type controllerSideEffect struct {
 	cancel             context.CancelCauseFunc
 	cancelOnBarrier    bool
 	cancelOnTransition bool
+	exec               bool
 }
 
 func newControllerService(ctx context.Context, opts controllerServiceOptions, runner controllerWorkspaceRunner, token string, log io.Writer) (*controllerService, error) {
@@ -328,6 +337,17 @@ func newControllerServiceWithStateSaver(
 	if err := validateControllerCoordinatorRegistrationURL(providerIdentity.CoordinatorRegistrationURL); err != nil {
 		return nil, fmt.Errorf("controller coordinator registration binding: %w", err)
 	}
+	if len(opts.ExecAllow) > 0 {
+		if opts.ExecMaxTimeout < controllerExecMinTimeout || opts.ExecMaxTimeout > controllerExecMaximumTimeout {
+			return nil, fmt.Errorf("exec max timeout must be between %s and %s", controllerExecMinTimeout, controllerExecMaximumTimeout)
+		}
+		execCtx, cancelExec := context.WithTimeout(ctx, opts.InspectTimeout)
+		err := verifyControllerExecSupport(execCtx, runner, providerIdentity.Route)
+		cancelExec()
+		if err != nil {
+			return nil, err
+		}
+	}
 	s := &controllerService{
 		ctx:                        ctx,
 		opts:                       opts,
@@ -347,6 +367,8 @@ func newControllerServiceWithStateSaver(
 		createOps:                  map[string]*controllerCreateOperation{},
 		reconcileTimers:            map[string]*controllerReconcileTimer{},
 		connectionSlots:            map[string]chan struct{}{},
+		execSlots:                  map[string]chan struct{}{},
+		execSem:                    make(chan struct{}, opts.MaxConcurrent),
 		localCleanupRetry:          map[string]struct{}{},
 		terminalRevocation:         map[string]controllerTerminalRevocation{},
 		desktopSetups:              make(chan struct{}, 1),
@@ -591,6 +613,14 @@ func (s *controllerService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.desktopConnection(w, r.Context(), id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "exec" && s.execEnabled() {
+		if r.Method != http.MethodPost {
+			writeControllerMethodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.workspaceExec(w, r, id)
 		return
 	}
 	if len(parts) != 1 {
@@ -965,7 +995,7 @@ func (s *controllerService) createWorkspace(w http.ResponseWriter, r *http.Reque
 		if existing.Status == "provisioning" || existing.Status == "stopping" {
 			status = http.StatusAccepted
 		}
-		writeControllerJSON(w, status, controllerResponse(existing))
+		writeControllerJSON(w, status, s.workspaceResponse(existing))
 		return
 	}
 	s.state.Workspaces[request.ID] = record
@@ -989,7 +1019,7 @@ func (s *controllerService) createWorkspace(w http.ResponseWriter, r *http.Reque
 		writeControllerDurabilityPending(w)
 		return
 	}
-	writeControllerJSON(w, http.StatusAccepted, controllerResponse(record))
+	writeControllerJSON(w, http.StatusAccepted, s.workspaceResponse(record))
 }
 
 func (s *controllerService) getWorkspace(w http.ResponseWriter, id string) {
@@ -1004,7 +1034,7 @@ func (s *controllerService) getWorkspace(w http.ResponseWriter, id string) {
 	case "provisioning", "ready", "stopping":
 		s.enqueue(id)
 	}
-	writeControllerJSON(w, http.StatusOK, controllerResponse(record))
+	writeControllerJSON(w, http.StatusOK, s.workspaceResponse(record))
 }
 
 func (s *controllerService) deleteWorkspace(w http.ResponseWriter, requestCtx context.Context, id string) {
@@ -1032,7 +1062,7 @@ func (s *controllerService) deleteWorkspace(w http.ResponseWriter, requestCtx co
 			writeControllerDurabilityPending(w)
 			return
 		}
-		writeControllerJSON(w, http.StatusOK, controllerResponse(record))
+		writeControllerJSON(w, http.StatusOK, s.workspaceResponse(record))
 		return
 	}
 	if record.Status == "stopping" {
@@ -1047,7 +1077,7 @@ func (s *controllerService) deleteWorkspace(w http.ResponseWriter, requestCtx co
 			writeControllerDurabilityPending(w)
 			return
 		}
-		writeControllerJSON(w, http.StatusAccepted, controllerResponse(record))
+		writeControllerJSON(w, http.StatusAccepted, s.workspaceResponse(record))
 		return
 	}
 	previous := record
@@ -1083,7 +1113,7 @@ func (s *controllerService) deleteWorkspace(w http.ResponseWriter, requestCtx co
 		writeControllerDurabilityPending(w)
 		return
 	}
-	writeControllerJSON(w, http.StatusAccepted, controllerResponse(record))
+	writeControllerJSON(w, http.StatusAccepted, s.workspaceResponse(record))
 }
 
 func writeControllerDurabilityPending(w http.ResponseWriter) {
@@ -1396,6 +1426,9 @@ func (s *controllerService) revokeReadyDesktopAfterTransitionFailure(record cont
 		TerminalStatus:  terminalStatus,
 		TerminalMessage: terminalMessage,
 	})
+	s.sideEffectGate.Lock()
+	s.cancelExecSideEffectsUnderGate(record.Request.ID, errControllerWorkspaceStopping)
+	s.sideEffectGate.Unlock()
 	s.setLocalCleanupRetry(record.Request.ID, true)
 	s.retryReadyLocalCleanup(record, true)
 	if current, ok := s.workspace(record.Request.ID); ok && current.Status == "ready" {
@@ -2513,6 +2546,9 @@ func validateControllerWorkspaceRequest(request controllerWorkspaceRequest, opts
 	if request.Capabilities.Code && !opts.Allowed.Code {
 		return fmt.Errorf("code capability is disabled by this controller")
 	}
+	if request.Capabilities.Exec && len(opts.ExecAllow) == 0 {
+		return fmt.Errorf("exec capability is disabled by this controller")
+	}
 	if err := validateControllerLeaseSeconds("ttlSeconds", request.TTLSeconds); err != nil {
 		return err
 	}
@@ -2672,7 +2708,11 @@ func validateControllerStateRecords(state controllerState) error {
 			Allowed: controllerCapabilities{Desktop: true, Browser: true, Code: true},
 			Profile: record.Request.Profile,
 		}
-		if err := validateControllerWorkspaceRequest(record.Request, validationOpts); err != nil {
+		// Exec is admitted per request against the running adapter's policy,
+		// so a restart without --exec-allow still loads the workspace.
+		validated := record.Request
+		validated.Capabilities.Exec = false
+		if err := validateControllerWorkspaceRequest(validated, validationOpts); err != nil {
 			return fmt.Errorf("controller state workspace %s request: %w", id, err)
 		}
 		for name, value := range map[string]string{"createdAt": record.CreatedAt, "updatedAt": record.UpdatedAt} {

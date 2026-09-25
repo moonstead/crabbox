@@ -8,6 +8,17 @@ export const runtimeAdapterRelayFrameLimit = 512 * 1024;
 export const runtimeAdapterRelayTimeoutMs = 14_000;
 export const runtimeAdapterDesktopRelayTimeoutMs = 150_000;
 export const runtimeAdapterDesktopRelayMaxTimeoutMs = 24 * 60 * 60 * 1_000 + 35_000;
+// Workspace exec is relayed only to connectors that advertise an exec budget:
+// the command timeout plus 30s of setup, plus 5s of response delivery.
+export const runtimeAdapterExecBodyLimit = 256 * 1024;
+export const runtimeAdapterExecRelayOverheadMs = 35_000;
+export const runtimeAdapterExecRelayMaxTimeoutMs =
+  60 * 60 * 1_000 + runtimeAdapterExecRelayOverheadMs;
+export const runtimeAdapterExecMinTimeoutMs = 1_000;
+export const runtimeAdapterExecMaxTimeoutMs = 60 * 60 * 1_000;
+export const runtimeAdapterExecMaxArgs = 256;
+export const runtimeAdapterExecMaxArgvBytes = 32 * 1024;
+export const runtimeAdapterExecMaxPendingPerAdapter = 4;
 
 export type RuntimeAdapterRelayRequest = {
   type: "request";
@@ -18,6 +29,20 @@ export type RuntimeAdapterRelayRequest = {
   deadlineMs: number;
   headers?: Record<string, string>;
   body?: string;
+};
+
+/** Withdraws an exec request whose caller went away or whose deadline passed. */
+export type RuntimeAdapterRelayCancel = {
+  type: "cancel";
+  id: string;
+};
+
+export type RuntimeAdapterExecRequest = {
+  argv: string[];
+  stdinBase64?: string;
+  timeoutMs: number;
+  leaseId?: string;
+  registrationId?: string;
 };
 
 export type RuntimeAdapterRelayResponse = {
@@ -53,6 +78,122 @@ export function runtimeAdapterProxyPath(parts: string[]): string | undefined {
     return `/v1/workspaces/${parts[2]}/connections/${parts[4]}`;
   }
   return undefined;
+}
+
+/**
+ * Returns the adapter path for POST /v1/workspaces/{id}/exec. It is separate
+ * from runtimeAdapterProxyPath so service authentication and the ordinary
+ * lifecycle relay surface never include command execution.
+ */
+export function runtimeAdapterExecPath(parts: string[]): string | undefined {
+  if (
+    parts.length === 4 &&
+    parts[0] === "v1" &&
+    parts[1] === "workspaces" &&
+    validRuntimeAdapterID(parts[2]) &&
+    parts[3] === "exec"
+  ) {
+    return `/v1/workspaces/${parts[2]}/exec`;
+  }
+  return undefined;
+}
+
+export function validRuntimeAdapterExecRelayTimeout(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= runtimeAdapterRelayTimeoutMs &&
+    value <= runtimeAdapterExecRelayMaxTimeoutMs
+  );
+}
+
+const runtimeAdapterExecKeys = new Set([
+  "argv",
+  "stdinBase64",
+  "timeoutMs",
+  "leaseId",
+  "registrationId",
+]);
+const standardBase64Pattern = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const canonicalLeaseIDPattern = /^cbx_[a-f0-9]{12}$/;
+
+/**
+ * Parses a caller's exec request strictly. It never returns or quotes the
+ * body: stdin is private and must not reach errors or logs.
+ */
+export function parseRuntimeAdapterExecRequest(
+  body: string,
+): RuntimeAdapterExecRequest | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some((key) => !runtimeAdapterExecKeys.has(key))) return undefined;
+  const { argv, stdinBase64, timeoutMs, leaseId, registrationId } = input;
+  if (
+    !Array.isArray(argv) ||
+    argv.length < 1 ||
+    argv.length > runtimeAdapterExecMaxArgs ||
+    argv.some((arg) => typeof arg !== "string" || arg.includes("\0")) ||
+    argv[0] === ""
+  ) {
+    return undefined;
+  }
+  const encoder = new TextEncoder();
+  const argvBytes = (argv as string[]).reduce(
+    (total, arg) => total + encoder.encode(arg).byteLength,
+    0,
+  );
+  if (argvBytes > runtimeAdapterExecMaxArgvBytes) return undefined;
+  if (
+    stdinBase64 !== undefined &&
+    (typeof stdinBase64 !== "string" || !standardBase64Pattern.test(stdinBase64))
+  ) {
+    return undefined;
+  }
+  if (
+    typeof timeoutMs !== "number" ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < runtimeAdapterExecMinTimeoutMs ||
+    timeoutMs > runtimeAdapterExecMaxTimeoutMs
+  ) {
+    return undefined;
+  }
+  if (
+    leaseId !== undefined &&
+    (typeof leaseId !== "string" || !canonicalLeaseIDPattern.test(leaseId))
+  ) {
+    return undefined;
+  }
+  if (registrationId !== undefined && !validRuntimeAdapterID(registrationId)) {
+    return undefined;
+  }
+  return {
+    argv: argv as string[],
+    ...(stdinBase64 === undefined || stdinBase64 === "" ? {} : { stdinBase64 }),
+    timeoutMs,
+    ...(leaseId === undefined ? {} : { leaseId }),
+    ...(registrationId === undefined ? {} : { registrationId }),
+  };
+}
+
+/** Binds an admitted request to the coordinator's exact lease generation. */
+export function runtimeAdapterExecRelayBody(
+  request: RuntimeAdapterExecRequest,
+  leaseId: string,
+  registrationId: string,
+): string {
+  return JSON.stringify({
+    argv: request.argv,
+    ...(request.stdinBase64 === undefined ? {} : { stdinBase64: request.stdinBase64 }),
+    timeoutMs: request.timeoutMs,
+    leaseId,
+    registrationId,
+  });
 }
 
 export function runtimeAdapterRelayMethodAllowed(method: string, path: string): boolean {
@@ -106,12 +247,15 @@ export function runtimeAdapterRelayContentType(
   return Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === "content-type")?.[1];
 }
 
-export async function readRuntimeAdapterRelayBody(request: Request): Promise<string | undefined> {
+export async function readRuntimeAdapterRelayBody(
+  request: Request,
+  limit = runtimeAdapterRelayBodyLimit,
+): Promise<string | undefined> {
   if (!request.body) {
     return undefined;
   }
   const declared = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > runtimeAdapterRelayBodyLimit) {
+  if (Number.isFinite(declared) && declared > limit) {
     throw new RangeError("runtime adapter request body is too large");
   }
   const reader = request.body.getReader();
@@ -122,7 +266,7 @@ export async function readRuntimeAdapterRelayBody(request: Request): Promise<str
     const { done, value } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > runtimeAdapterRelayBodyLimit) {
+    if (size > limit) {
       void reader.cancel();
       throw new RangeError("runtime adapter request body is too large");
     }

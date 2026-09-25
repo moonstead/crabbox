@@ -34,14 +34,15 @@ reports support for this command on completed fixed-ID leases of the selected ta
 reports support for repository-scoped cleanup of **fixed-ID** leases. Integrations
 that require both must reject either false value before allocating. These flags
 do not prove credentials, connectivity, capacity, or an existing lease's state.
-`--check` cannot combine an ID, command, or `--pty`.
+`--check` cannot combine an ID, command, `--pty`, or supervisor options.
 
 Direct Daytona initially supports both capabilities for completed fixed-ID leases
 through its existing native activity renewal and fixed-lease release fence.
-Ordinary Daytona leases and incomplete fixed acquisitions are rejected before
-native access preparation; use `run` for ordinary leases. Other providers,
-including AWS and Machine0, and coordinator
-routes report both unavailable. The underlying `claim-exec` and `fixed-current-repo-stop`
+Direct Proxmox supports execution for completed fixed-ID leases through its
+fixed-lease release fence; it does not renew idle activity. Ordinary leases and
+incomplete fixed acquisitions are rejected before native access preparation; use
+`run` for ordinary leases. Other providers, including AWS and Machine0, and
+coordinator routes report both unavailable. The underlying `claim-exec` and `fixed-current-repo-stop`
 feature names also appear in `crabbox providers --json`.
 
 Run from the repository that currently owns the lease. `--id` requires the
@@ -57,7 +58,8 @@ writers, including reclaim and release, wait for execution to finish. Provider
 activity renewal runs where supported; it does not extend the maximum lease
 lifetime. Cancellation terminates and joins the owned local SSH process tree
 before releasing the fence. Remote process termination follows the SSH server's
-session behavior; detached remote processes are outside this command's lifetime.
+session behavior; detached remote processes are outside this command's lifetime
+unless `--terminate-remote-on-disconnect` is set.
 
 SSH credentials remain in private temporary configuration, never in printed
 commands or child arguments. The temporary configuration is removed after the
@@ -82,6 +84,33 @@ leases. Unsupported providers and Windows targets
 are rejected; there is no raw-credential fallback. Provider-native proxy routes
 are retained through Crabbox's private SSH transport.
 
+## Supervisor options
+
+A trusted supervisor that returns results to another principal, such as the
+runtime adapter's [workspace exec](../features/runtime-adapter-exec.md), can
+use three further options. None can be combined with `--check`.
+`--status-fd` and `--terminate-remote-on-disconnect` cannot be combined with
+`--pty`, because a remote terminal echoes input into output.
+
+- `--status-fd <n>` writes JSON status lines to an inherited descriptor of at
+  least 3. `{"event":"started"}` is written once the SSH command has started,
+  so any other nonzero exit is a Crabbox setup failure rather than the remote
+  command's status. Provider preparation diagnostics are kept out of stderr in
+  this mode. The descriptor is not inherited by the SSH transport.
+- `--expect-runtime-registration <id>` requires the lease claim to hold exactly
+  this acknowledged runtime adapter registration generation, with no pending
+  replacement. It is checked under the shared claim fence before provider
+  access, so a rotation or release cannot interleave with the command. A
+  mismatch exits 4 and, with `--status-fd`, writes
+  `{"event":"rejected","reason":"registration"}`.
+- `--terminate-remote-on-disconnect` runs the command in its own remote process
+  group and terminates that group, with `TERM` and then `KILL` after five
+  seconds, once the SSH session that started it has ended. Without a PTY,
+  sshd does not signal remote commands when the client goes away. The remote
+  host needs a POSIX `sh`; `setsid` is used when available, otherwise only the
+  direct child is signalled. Processes that start their own session remain
+  outside this guard.
+
 ## Flags
 
 ```text
@@ -90,6 +119,11 @@ are retained through Crabbox's private SSH transport.
 --pty                      Allocate a remote pseudo-terminal.
 --provider <name>          Explicit provider override; defaults to stored routing.
 --network auto|tailscale|public
+--status-fd <n>            Supervisor status descriptor (3 or higher).
+--expect-runtime-registration <id>
+                           Required runtime adapter registration generation.
+--terminate-remote-on-disconnect
+                           Stop the remote process group when the session ends.
 ```
 
 Provider-specific routing flags are the same as [`ssh`](ssh.md).

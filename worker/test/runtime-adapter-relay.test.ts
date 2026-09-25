@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseRuntimeAdapterExecRequest,
   readRuntimeAdapterRelayBody,
+  runtimeAdapterExecBodyLimit,
+  runtimeAdapterExecPath,
+  runtimeAdapterExecRelayBody,
+  runtimeAdapterExecRelayMaxTimeoutMs,
   runtimeAdapterProxyPath,
   runtimeAdapterRelayBodyAllowed,
   runtimeAdapterRelayBodyLimit,
@@ -12,6 +17,7 @@ import {
   runtimeAdapterRelayMethodAllowed,
   runtimeAdapterRelayTimeoutForPath,
   runtimeAdapterRelayTimeoutMs,
+  validRuntimeAdapterExecRelayTimeout,
   validRuntimeAdapterID,
   validRuntimeAdapterRelayResponse,
 } from "../src/runtime-adapter-relay";
@@ -185,5 +191,76 @@ describe("runtime adapter relay", () => {
         "request-1",
       ),
     ).toBe(false);
+  });
+
+  it("keeps exec off the ordinary proxy and service-auth surface", () => {
+    const parts = ["v1", "workspaces", "example-workspace", "exec"];
+    expect(runtimeAdapterProxyPath(parts)).toBeUndefined();
+    expect(runtimeAdapterExecPath(parts)).toBe("/v1/workspaces/example-workspace/exec");
+    expect(runtimeAdapterExecPath(["v1", "workspaces", "Example", "exec"])).toBeUndefined();
+    expect(runtimeAdapterExecPath(["v1", "workspaces", "..", "exec"])).toBeUndefined();
+    expect(
+      runtimeAdapterExecPath(["v1", "workspaces", "example-workspace", "exec", "x"]),
+    ).toBeUndefined();
+    expect(runtimeAdapterExecPath(["v1", "workspaces", "exec"])).toBeUndefined();
+  });
+
+  it("parses exec requests strictly and binds the coordinator generation", () => {
+    const secret = "enrolment-secret-5f2c9e";
+    const valid = {
+      argv: ["sh", "-s", "--", "--start"],
+      stdinBase64: btoa(secret),
+      timeoutMs: 600_000,
+    };
+    const parsed = parseRuntimeAdapterExecRequest(JSON.stringify(valid));
+    expect(parsed).toEqual(valid);
+    expect(
+      JSON.parse(runtimeAdapterExecRelayBody(parsed!, "cbx_000000000007", "registration-7")),
+    ).toEqual({
+      ...valid,
+      leaseId: "cbx_000000000007",
+      registrationId: "registration-7",
+    });
+    for (const body of [
+      "not json",
+      "[]",
+      JSON.stringify({ ...valid, env: { TOKEN: secret } }),
+      JSON.stringify({ ...valid, argv: [] }),
+      JSON.stringify({ ...valid, argv: [""] }),
+      JSON.stringify({ ...valid, argv: ["sh", 1] }),
+      JSON.stringify({ ...valid, argv: ["sh", "a\0b"] }),
+      JSON.stringify({ ...valid, argv: ["sh", "x".repeat(32 * 1024)] }),
+      JSON.stringify({ ...valid, argv: Array.from({ length: 257 }, () => "a") }),
+      JSON.stringify({ ...valid, stdinBase64: "not base64!" }),
+      JSON.stringify({ ...valid, timeoutMs: 999 }),
+      JSON.stringify({ ...valid, timeoutMs: 60 * 60 * 1000 + 1 }),
+      JSON.stringify({ ...valid, timeoutMs: 1.5 }),
+      JSON.stringify({ ...valid, leaseId: "cbx_ZZZ" }),
+      JSON.stringify({ ...valid, registrationId: "Registration_7" }),
+    ]) {
+      expect(parseRuntimeAdapterExecRequest(body)).toBeUndefined();
+    }
+  });
+
+  it("bounds exec bodies and connector exec budgets", async () => {
+    expect(runtimeAdapterExecBodyLimit).toBe(256 * 1024);
+    const oversized = new Request("https://crabbox.test/exec", {
+      method: "POST",
+      body: "x".repeat(runtimeAdapterExecBodyLimit + 1),
+    });
+    await expect(
+      readRuntimeAdapterRelayBody(oversized, runtimeAdapterExecBodyLimit),
+    ).rejects.toThrow(RangeError);
+    const ordinary = new Request("https://crabbox.test/exec", {
+      method: "POST",
+      body: "x".repeat(runtimeAdapterRelayBodyLimit + 1),
+    });
+    await expect(readRuntimeAdapterRelayBody(ordinary)).rejects.toThrow(RangeError);
+    expect(validRuntimeAdapterExecRelayTimeout(runtimeAdapterRelayTimeoutMs)).toBe(true);
+    expect(validRuntimeAdapterExecRelayTimeout(runtimeAdapterExecRelayMaxTimeoutMs)).toBe(true);
+    expect(validRuntimeAdapterExecRelayTimeout(runtimeAdapterExecRelayMaxTimeoutMs + 1)).toBe(
+      false,
+    );
+    expect(validRuntimeAdapterExecRelayTimeout(1.5)).toBe(false);
   });
 });

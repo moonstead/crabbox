@@ -260,6 +260,7 @@ POST   /v1/adapters/{adapter-id}/ticket
 GET    /v1/adapters/{adapter-id}
 GET    /v1/adapters/{adapter-id}/agent    (websocket; one-time ticket auth)
 *      /v1/adapters/{adapter-id}/proxy/v1/workspaces/...
+POST   /v1/adapters/{adapter-id}/proxy/v1/workspaces/{workspace-id}/exec  (opt-in workspace exec)
 ```
 
 Current CLIs bind each ordinary `POST` create to a fresh opaque attempt token
