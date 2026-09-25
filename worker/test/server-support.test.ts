@@ -12,6 +12,7 @@ import {
   drainAndStop,
   authenticatedRequestBodyBytes,
   fleetRequestQueue,
+  forwardedRequestProtocol,
   isReadinessRequestMethod,
   isTrustedProxySource,
   nodeResponseHeaders,
@@ -315,6 +316,15 @@ describe("Node server support", () => {
     expect(requestSourceIP("10.0.0.2", "198.51.100.8, 10.0.0.3", ranges)).toBe("198.51.100.8");
     expect(requestSourceIP("::ffff:198.51.100.8", undefined, ranges)).toBe("198.51.100.8");
     expect(requestSourceIP(undefined, "198.51.100.8", ranges)).toBeUndefined();
+  });
+
+  it("maps forwarded WebSocket schemes to their HTTP origin schemes", () => {
+    expect(forwardedRequestProtocol("wss")).toBe("https");
+    expect(forwardedRequestProtocol("WS")).toBe("http");
+    expect(forwardedRequestProtocol(" https ")).toBe("https");
+    expect(forwardedRequestProtocol("http")).toBe("http");
+    expect(forwardedRequestProtocol("")).toBe("http");
+    expect(forwardedRequestProtocol(undefined)).toBe("http");
   });
 
   it("rejects declared oversized bodies without reading their stream", async () => {
