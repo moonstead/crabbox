@@ -512,6 +512,9 @@ Put `tokenSecret` in a private config file or use
 `CRABBOX_PROXMOX_TOKEN_SECRET`; do not pass it as a command-line flag.
 Set `templateDesktop` or `templateBrowser` only for a template prepared as
 described in [Proxmox desktop and browser templates](../providers/proxmox.md#desktop-and-browser-templates).
+Set `guest: lxc` with `lxcTemplate` and the `lxc*` resource bounds for headless
+unprivileged containers, as described in
+[Proxmox unprivileged LXC containers](../providers/proxmox.md#unprivileged-lxc-containers).
 
 ### XCP-ng
 

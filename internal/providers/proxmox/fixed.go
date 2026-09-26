@@ -42,14 +42,28 @@ func fixedProxmoxFingerprint(cfg core.Config, req core.AcquireRequest, providerS
 		{Name: "targetOS", Value: strings.TrimSpace(cfg.TargetOS)}, {Name: "requestedSlug", Value: core.NormalizeLeaseSlug(req.RequestedSlug), OmitEmpty: true},
 		{Name: "keep", Value: req.Keep}, {Name: "ttlNanoseconds", Value: cfg.TTL.Nanoseconds()},
 		{Name: "idleNanoseconds", Value: cfg.IdleTimeout.Nanoseconds()}, {Name: "sshPublicKey", Value: strings.TrimSpace(publicKey)},
+		// LXC settings are omitted for QEMU, so QEMU fingerprints are unchanged.
+		{Name: "guest", Value: fixedProxmoxLXCValue(cfg, core.ProxmoxGuest(cfg)), OmitEmpty: true},
+		{Name: "lxcTemplate", Value: fixedProxmoxLXCValue(cfg, strings.TrimSpace(cfg.Proxmox.LXCTemplate)), OmitEmpty: true},
+		{Name: "lxcCores", Value: cfg.Proxmox.LXCCores, OmitEmpty: true},
+		{Name: "lxcMemoryMiB", Value: cfg.Proxmox.LXCMemoryMiB, OmitEmpty: true},
+		{Name: "lxcSwapMiB", Value: cfg.Proxmox.LXCSwapMiB, OmitEmpty: true},
+		{Name: "lxcDiskGiB", Value: cfg.Proxmox.LXCDiskGiB, OmitEmpty: true},
 	})
+}
+
+func fixedProxmoxLXCValue(cfg core.Config, value string) string {
+	if core.ProxmoxGuest(cfg) != core.ProxmoxGuestLXC {
+		return ""
+	}
+	return value
 }
 
 func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	if !core.IsCanonicalLeaseID(req.RequestedLeaseID) || req.RequestedCheckpointID != "" || b.Cfg.TargetOS != core.TargetLinux {
 		return core.LeaseTarget{}, core.Exit(2, "fixed Proxmox creation requires a canonical lease ID and a Linux template")
 	}
-	if b.Cfg.Proxmox.TemplateID <= 0 {
+	if b.Cfg.Proxmox.TemplateID <= 0 && core.ProxmoxGuest(b.Cfg) != core.ProxmoxGuestLXC {
 		return core.LeaseTarget{}, core.Exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
 	}
 	leaseID := strings.TrimSpace(req.RequestedLeaseID)
@@ -159,7 +173,7 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 			return core.Server{}, err
 		}
 
-		fmt.Fprintf(b.RT.Stderr, "provisioning provider=proxmox lease=%s slug=%s node=%s template=%d vmid=%d keep=%v fixed=true\n", leaseID, intent.Slug, cfg.Proxmox.Node, cfg.Proxmox.TemplateID, vmid, req.Keep)
+		fmt.Fprintf(b.RT.Stderr, "provisioning provider=proxmox guest=%s lease=%s slug=%s node=%s template=%s vmid=%d keep=%v fixed=true\n", core.ProxmoxGuest(cfg), leaseID, intent.Slug, cfg.Proxmox.Node, core.ProxmoxTemplateLabel(cfg), vmid, req.Keep)
 		server, err := client.CreateServerWithVMID(ctx, cfg, publicKey, leaseID, intent.Slug, req.Keep, vmid, maps.Clone(claim.Labels), func(created core.Server) error {
 			if err := validateFixedProxmoxServer(created, *claim, vmid, node); err != nil {
 				return err
@@ -169,6 +183,10 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 		if err != nil {
 			var apiErr *core.ProxmoxError
 			clonePath := fmt.Sprintf("/nodes/%s/qemu/%d/clone", url.PathEscape(cfg.Proxmox.Node), cfg.Proxmox.TemplateID)
+			if core.ProxmoxGuest(cfg) == core.ProxmoxGuestLXC {
+				// A refused container create allocated nothing.
+				clonePath = "/nodes/" + url.PathEscape(cfg.Proxmox.Node) + "/lxc"
+			}
 			if errors.As(err, &apiErr) && apiErr.Method == http.MethodPost && apiErr.Path == clonePath &&
 				(apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
 				return core.Server{}, &core.FixedCreateRejected{Err: err}
@@ -218,7 +236,7 @@ func fixedProxmoxAuthorizationRejection(err error) error {
 }
 
 func fixedProxmoxIdentityLabels(cfg core.Config, leaseID, slug, fingerprint, node string) map[string]string {
-	return core.FixedIdentityLabels("proxmox", leaseID, slug, fingerprint, map[string]string{"node": node, "template_id": strconv.Itoa(cfg.Proxmox.TemplateID)})
+	return core.FixedIdentityLabels("proxmox", leaseID, slug, fingerprint, map[string]string{"node": node, "template_id": core.ProxmoxTemplateLabel(cfg)})
 }
 
 func fixedProxmoxAttempt(claim core.LeaseClaim) (int, string, error) {

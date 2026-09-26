@@ -29,8 +29,18 @@ func (c *fixedProxmoxClient) NextVMID(context.Context) (int, error) {
 	return c.nextVMID, nil
 }
 
-func (c *fixedProxmoxClient) CreateServerWithVMID(_ context.Context, _ core.Config, _ string, leaseID, slug string, _ bool, vmid int, labels map[string]string, bind func(core.Server) error) (core.Server, error) {
+func (c *fixedProxmoxClient) CreateServerWithVMID(_ context.Context, cfg core.Config, _ string, leaseID, slug string, _ bool, vmid int, labels map[string]string, bind func(core.Server) error) (core.Server, error) {
 	c.fixedCreates++
+	labels = maps.Clone(labels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	generation := fixedTestGeneration
+	if core.ProxmoxGuest(cfg) == core.ProxmoxGuestLXC {
+		// The real client labels a container with the generation it created.
+		generation = lxcTestGeneration
+		labels[core.ProxmoxLXCGenerationLabel] = generation
+	}
 	if c.beforeClone != nil {
 		if err := c.beforeClone(vmid, labels); err != nil {
 			return core.Server{}, err
@@ -43,7 +53,7 @@ func (c *fixedProxmoxClient) CreateServerWithVMID(_ context.Context, _ core.Conf
 		Provider:    "proxmox",
 		CloudID:     "417",
 		HostID:      "pve1",
-		ImmutableID: fixedTestGeneration,
+		ImmutableID: generation,
 		ID:          417,
 		Name:        "crabbox-" + slug,
 		Labels:      maps.Clone(labels),

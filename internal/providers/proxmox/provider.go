@@ -14,6 +14,9 @@ func init() {
 type Provider struct{}
 
 func (Provider) ServerTypeForConfig(cfg core.Config) string {
+	if core.ProxmoxGuest(cfg) == core.ProxmoxGuestLXC {
+		return "lxc"
+	}
 	if cfg.Proxmox.TemplateID > 0 {
 		return "template-" + strconv.Itoa(cfg.Proxmox.TemplateID)
 	}
@@ -49,8 +52,9 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 	if err != nil {
 		return err
 	}
-	// This projection depends only on TemplateID, including explicit zero/negative values.
-	if core.FlagWasSet(fs, "proxmox-template-id") {
+	// This projection depends only on the lease type and TemplateID, including
+	// explicit zero/negative values.
+	if core.FlagWasSet(fs, "proxmox-template-id") || core.FlagWasSet(fs, "proxmox-guest") {
 		cfg.ServerType = (Provider{}).ServerTypeForConfig(*cfg)
 	}
 	if applied.User {
