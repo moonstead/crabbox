@@ -435,7 +435,10 @@ such as Stead, requires it.
 
 Reading the key needs `VM.GuestAgent.FileRead` on the lease pool (PVE 9; on
 PVE 8 the agent file read needs `VM.Monitor`). LXC containers have no guest
-agent, so an LXC lease records no key and reports no pinned identity.
+agent, so an LXC lease records no key and reports no pinned identity. An LXC
+lease is never pinned even if its description carries a key, because nothing
+attested it. Callers that require a pinned identity, such as Stead, therefore
+refuse LXC leases until an attested LXC identity exists (STEAD-7).
 
 ## Readiness and token permissions
 

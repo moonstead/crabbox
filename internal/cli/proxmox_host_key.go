@@ -64,11 +64,16 @@ func (c *ProxmoxClient) waitGuestSSHHostKey(ctx context.Context, vmid int) (stri
 // PinProxmoxHostKey pins an SSH target to the host key recorded when the
 // lease was created. The key is checked strictly, under a per-lease alias in
 // the lease's own known_hosts, so trust follows the lease and never the
-// address. Leases without a recorded key, such as LXC leases, are unchanged
-// and report no pinned identity.
+// address. Leases without a recorded key are unchanged and report no pinned
+// identity.
+//
+// Only a QEMU guest agent attests a key. An LXC lease has no agent, so it is
+// never pinned, even if its description carries a key: that key came from
+// somewhere other than the hypervisor. LXC leases report no pinned identity
+// until STEAD-7 gives them an attested one.
 func PinProxmoxHostKey(target *SSHTarget, server Server, leaseID string) error {
 	key := strings.TrimSpace(server.Labels[ProxmoxSSHHostKeyLabel])
-	if key == "" {
+	if key == "" || server.Labels[ProxmoxLXCGenerationLabel] != "" {
 		return nil
 	}
 	target.SSHHostKey = key
