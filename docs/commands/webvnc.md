@@ -177,6 +177,42 @@ Observer mode is a collaboration UX for trusted shared leases; it relies on the
 portal noVNC client staying read-only and is not a hostile-client isolation
 boundary.
 
+### Exclusive input with a guest input gate
+
+A Linux guest can enforce who gives the desktop input by putting an input gate
+in front of its VNC server on the loopback port. The gate answers a new
+connection with `CBXGATE 001\n` instead of an RFB version. The bridge
+recognises that greeting, advertises the `input_gate` capability, and then
+frames all traffic: RFB bytes as data frames, and a small set of JSON messages
+as control frames. A guest without a gate is unaffected.
+
+With a gate, input is bound to a viewer session rather than to whoever is
+connected:
+
+- When the coordinator pairs a viewer with a bridge connection, it sends that
+  connection one `input_binding`: the lease ID and a SHA-256 value derived
+  from the lease and the viewer's portal session, never the session cookie.
+  A reconnect of the same viewer session gets the same binding.
+- The viewer page asks for control with
+  `POST /portal/leases/{lease}/vnc/input` (`/vnc/embed/input` for the
+  embedded viewer) and `{"viewerID": ..., "action": "take" | "return"}`. The coordinator accepts
+  it only for the requester's own viewer session and carries it down that
+  viewer's own bridge connection as `input_request`.
+- The gate decides and answers with `input_result`, and reports changes with
+  `input_state`. `GET .../vnc/status` returns them as
+  `input: {gate, owner, holder}`, where `owner` is `agent`, `human` or `none`
+  and `holder` is `self`, `other` or `none` for the viewer asking.
+- The coordinator drops every `input_*` message a viewer sends, and the
+  bridge forwards only the coordinator's `input_binding` and `input_request`
+  as control frames. A viewer therefore cannot forge a binding or speak for
+  another session; everything it sends reaches the gate as data, which the
+  gate parses and filters.
+
+The gate, not the viewer page, enforces input: a viewer that does not hold
+control is view-only whatever its client does. The page mirrors the state by
+setting noVNC's `viewOnly` and shows **take control** or **return to agent**.
+Stead's guest implements a gate; see its `docs/desktop-input.md`.
+
 `--take-control` asks the viewer to request control once it connects. Bearer
 bootstrap sessions carry that hint server-side; the existing human Portal path
 uses the URL fragment. It is a viewer hint, not a new permission boundary:

@@ -1064,6 +1064,7 @@ export function portalVNC(
   const wsPath = `${routeBase}/viewer`;
   const statusPath = `${routeBase}/status`;
   const controlPath = `${routeBase}/control`;
+  const inputPath = `${routeBase}/input`;
   const themePath = `${routeBase}/theme`;
   const handoffPath = `${routeBase}/handoff`;
   const sharePath = `/portal/leases/${encodeURIComponent(lease.id)}/share`;
@@ -1220,6 +1221,7 @@ export function portalVNC(
       wsURL.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const statusURL = new URL(${JSON.stringify(statusPath)}, window.location.href);
       const controlURL = new URL(${JSON.stringify(controlPath)}, window.location.href);
+      const inputURL = new URL(${JSON.stringify(inputPath)}, window.location.href);
       const themeURL = new URL(${JSON.stringify(themePath)}, window.location.href);
       const handoffURL = new URL(${JSON.stringify(handoffPath)}, window.location.href);
       const sharePageURL = new URL(${JSON.stringify(sharePath)}, window.location.href);
@@ -1439,6 +1441,10 @@ export function portalVNC(
       let statusTimer;
       let controllerLabel = "";
       let isController = false;
+      // Set when the desktop's input gate reports who holds input. The gate
+      // enforces it in the guest; viewOnly here only mirrors it.
+      let inputGate = null;
+      const inputTimeoutMs = 60000;
       let controllerID = "";
       let sizingOwnerChanged = false;
       let sizingHandoffPending = false;
@@ -1472,6 +1478,7 @@ export function portalVNC(
         for (const controller of collaborationControllers) controller.abort();
         connected = false;
         isController = false;
+        inputGate = null;
         statusPending = false;
         controlPending = false;
         window.clearInterval(statusTimer);
@@ -1513,7 +1520,7 @@ export function portalVNC(
           return fallback;
         }
       }
-      async function collaborationOperation(operation) {
+      async function collaborationOperation(operation, timeoutMs = collaborationTimeoutMs) {
         const controller = new AbortController();
         collaborationControllers.add(controller);
         let timedOut = false;
@@ -1522,7 +1529,7 @@ export function portalVNC(
         const timer = window.setTimeout(() => {
           timedOut = true;
           controller.abort();
-        }, collaborationTimeoutMs);
+        }, timeoutMs);
         try {
           const result = await operation(controller.signal);
           // A JSON fallback must not convert a cancelled takeover into success.
@@ -1591,12 +1598,39 @@ export function portalVNC(
         if (nextControllerID) controllerID = nextControllerID;
         sizingHandoffPending = state.wayvncHandoff === "pending";
         if (state.wayvncHandoff === "verified") sizingOwnerChanged = false;
-        const controlling = role === "controller";
+        const previousInput = inputGate;
+        inputGate = state.input?.gate === true ? state.input : null;
+        const controlling = inputGate ? inputGate.holder === "self" : role === "controller";
         const connectedViewer = role === "controller" || role === "observer";
         isController = controlling;
         applySizing();
         if (controlling) window.setTimeout(focusVNC, 0);
-        if (takeoverBtn) {
+        if (takeoverBtn && inputGate) {
+          const heldByOther = inputGate.owner === "human" && inputGate.holder === "other";
+          takeoverBtn.hidden = !connectedViewer;
+          takeoverBtn.disabled = controlPending || heldByOther || !connectedViewer;
+          takeoverBtn.dataset.role = controlling ? "controller" : "observer";
+          takeoverBtn.textContent = controlling ? "return to agent" : "take control";
+          takeoverBtn.title = controlling
+            ? "You have the desktop's input. Return it to the agent when you are done."
+            : heldByOther
+              ? "Another viewer has the desktop's input"
+              : inputGate.owner === "agent"
+                ? "The agent has the desktop's input. Take control to pause the agent."
+                : "Nobody has the desktop's input. Take control, then return it to the agent.";
+          if (!previousInput || previousInput.owner !== inputGate.owner || previousInput.holder !== inputGate.holder) {
+            setStatus(
+              controlling
+                ? "you have control"
+                : heldByOther
+                  ? "another viewer has control"
+                  : inputGate.owner === "agent"
+                    ? "the agent has control"
+                    : "nobody has control",
+              controlling ? "ok" : inputGate.owner === "none" ? "warn" : "",
+            );
+          }
+        } else if (takeoverBtn) {
           takeoverBtn.hidden = !connectedViewer;
           takeoverBtn.disabled = controlling || !connectedViewer;
           takeoverBtn.dataset.role = controlling ? "controller" : "observer";
@@ -1607,7 +1641,7 @@ export function portalVNC(
               ? "Currently observing; " + controllerLabel + " controls"
               : "Currently observing";
         }
-        if (!controlling && connectedViewer && previousControllerLabel && controllerLabel && previousControllerLabel !== controllerLabel) {
+        if (!inputGate && !controlling && connectedViewer && previousControllerLabel && controllerLabel && previousControllerLabel !== controllerLabel) {
           setStatus(controllerLabel + " took control", "warn");
         }
         if (controlling && !wasController) {
@@ -1666,6 +1700,32 @@ export function portalVNC(
         } finally {
           if (epoch === connectionEpoch) controlPending = false;
         }
+      }
+      async function changeInput(action) {
+        if (!connected || controlPending) return;
+        const epoch = connectionEpoch;
+        controlPending = true;
+        const button = document.getElementById("vnc-takeover");
+        if (button) button.disabled = true;
+        setStatus(action === "take" ? "pausing the agent" : "returning control to the agent");
+        try {
+          const { response, result } = await collaborationOperation(async (signal) => {
+            const response = await fetch(inputURL, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ viewerID, action }),
+              signal,
+            });
+            const result = await response.json().catch(() => ({}));
+            return { response, result };
+          }, inputTimeoutMs);
+          if (!connected || epoch !== connectionEpoch) return;
+          if (!response.ok) throw new Error(result.message || "control did not change");
+        } finally {
+          if (epoch === connectionEpoch) controlPending = false;
+        }
+        await refreshCollaborationState();
+        focusVNC();
       }
       async function takeControlIfRequested(state) {
         if (!takeControlOnConnect || takeControlAttempted) return;
@@ -1862,6 +1922,10 @@ export function portalVNC(
       const takeoverBtn = document.getElementById("vnc-takeover");
       takeoverBtn?.addEventListener("click", async () => {
         try {
+          if (inputGate) {
+            await changeInput(inputGate.holder === "self" ? "return" : "take");
+            return;
+          }
           await takeControl();
         } catch (error) {
           setStatus(error instanceof Error ? error.message : String(error), "bad");

@@ -42,8 +42,11 @@ POST /portal/logout                              end the portal and its live bri
 
 The WebVNC viewer page also drives a small set of bridge sub-routes that the
 browser calls directly: `/vnc/viewer` (the noVNC WebSocket), `/vnc/status`,
-`/vnc/control` (take control), `/vnc/theme` (sync the desktop theme), and
-`/vnc/handoff` (consume a server-bound credential handoff).
+`/vnc/control` (take control), `/vnc/input` (take or return exclusive input
+when the guest has an input gate; see
+[webvnc](../commands/webvnc.md#exclusive-input-with-a-guest-input-gate)),
+`/vnc/theme` (sync the desktop theme), and `/vnc/handoff` (consume a
+server-bound credential handoff).
 Static assets, including the noVNC client at `/portal/assets/novnc/rfb.js`,
 are served from the coordinator's bundled assets.
 
