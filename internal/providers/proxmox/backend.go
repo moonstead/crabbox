@@ -132,6 +132,10 @@ func (b *leaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug
 		}
 	}
 	target := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
+	if err := core.PinProxmoxHostKey(&target, server, leaseID); err != nil {
+		b.cleanupFailedAcquire(client, server, leaseID)
+		return core.LeaseTarget{}, err
+	}
 	if err := waitForSSHReadyFunc(ctx, &target, b.RT.Stderr, "bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
 		b.cleanupFailedAcquire(client, server, leaseID)
 		return core.LeaseTarget{}, err
@@ -357,6 +361,9 @@ func (b *leaseBackend) targetForServer(server core.Server, releaseOnly bool) (co
 	leaseID := core.Blank(server.Labels["lease"], server.CloudID)
 	if !releaseOnly {
 		if err := core.UseStoredTestboxKey(&target, leaseID); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if err := core.PinProxmoxHostKey(&target, server, leaseID); err != nil {
 			return core.LeaseTarget{}, err
 		}
 	}
@@ -699,6 +706,9 @@ func removeCleanupLeaseResidue(ctx context.Context, client proxmoxClient, delete
 				target := core.SSHTargetFromConfig(cfg, survivors[0].PublicNet.IPv4.IP)
 				if target.Port == "" && claim.SSHPort > 0 {
 					target.Port = strconv.Itoa(claim.SSHPort)
+				}
+				if err := core.PinProxmoxHostKey(&target, survivors[0], leaseID); err != nil {
+					return err
 				}
 				if _, err := core.ReplaceLeaseClaimEndpointIfUnchangedWithProviderMetadata(leaseID, claim, survivors[0], target); err != nil {
 					fmt.Fprintf(stderr, "warning: preserve local lease residue lease=%s reason=claim_retarget_failed error=%v\n", leaseID, err)
