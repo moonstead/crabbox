@@ -105,6 +105,17 @@ func TestPinProxmoxHostKeyChecksStrictlyByLeaseNotAddress(t *testing.T) {
 	if unpinned.SSHHostKey != "" {
 		t.Fatalf("unpinned=%#v", unpinned)
 	}
+
+	// An LXC lease is never pinned, even with a key in its description: no
+	// guest agent attested it.
+	lxc := SSHTarget{Host: "10.77.0.102", Port: "22", User: "crabbox"}
+	lxcServer := Server{Labels: map[string]string{ProxmoxSSHHostKeyLabel: hostKey, ProxmoxLXCGenerationLabel: "0123456789abcdef0123456789abcdef"}}
+	if err := PinProxmoxHostKey(&lxc, lxcServer, "cbx_fedcba654321"); err != nil {
+		t.Fatal(err)
+	}
+	if lxc.SSHHostKey != "" || lxc.HostKeyAlias != "" || lxc.KnownHostsFile != "" {
+		t.Fatalf("lxc=%#v: an LXC lease must report no pinned identity", lxc)
+	}
 }
 
 func TestControllerReportsAPinnedSSHHostIdentity(t *testing.T) {
