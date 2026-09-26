@@ -417,6 +417,29 @@ passwordless `sudo`. Keep credentials, host keys and a machine ID out of it.
 Treat the archive as immutable: give every build a new file name and never
 overwrite one that a configuration names.
 
+## Attested SSH host keys
+
+A QEMU lease never trusts an SSH host key on first use. Before its first SSH
+connection, Crabbox reads the guest's ed25519 host key through the QEMU guest
+agent. The agent is a virtio channel the hypervisor binds to that one VM, so
+no other guest or network peer can answer for it, even one that claims the
+guest's address. Crabbox records the key in the VM's Proxmox description,
+where the guest cannot change it, and every later connection (bootstrap,
+exec, WebVNC tunnels) checks it with `StrictHostKeyChecking=yes` under a
+per-lease `HostKeyAlias`, with no global known hosts, DNS or address checks.
+Trust follows the lease, not the address.
+
+The runtime adapter reports `sshHostKeyPinned: true` on a ready workspace
+whose key was pinned. A caller that must not send secrets to the wrong guest,
+such as Stead, requires it.
+
+Reading the key needs `VM.GuestAgent.FileRead` on the lease pool (PVE 9; on
+PVE 8 the agent file read needs `VM.Monitor`). LXC containers have no guest
+agent, so an LXC lease records no key and reports no pinned identity. An LXC
+lease is never pinned even if its description carries a key, because nothing
+attested it. Callers that require a pinned identity, such as Stead, therefore
+refuse LXC leases until an attested LXC identity exists (STEAD-7).
+
 ## Readiness and token permissions
 
 `crabbox doctor --provider proxmox` is the readiness gate for this provider. In
@@ -492,7 +515,8 @@ rerun doctor before attempting `warmup` or `run`. Doctor requires propagated
 treating `/cluster/resources?type=vm` as authoritative for that VM. Lease
 lifecycle operations additionally need the corresponding VM clone, allocation,
 configuration, power-management, datastore-allocation, and pool-allocation
-privileges.
+privileges, and `VM.GuestAgent.FileRead` to read a QEMU guest's SSH host key
+(see [Attested SSH host keys](#attested-ssh-host-keys)).
 
 For CI or lab smoke checks after building the local binary:
 
@@ -575,11 +599,15 @@ known wrapper credential filenames.
    guest agent, `tags=crabbox`, and Crabbox labels in the VM description.
 5. Start the VM and wait for the QEMU guest agent to report a non-loopback
    IPv4 address (skipping `lo`, `docker*`, and `veth*` interfaces).
-6. Wait for SSH to come up, then run the Crabbox Linux bootstrap over SSH as
+6. Read the guest's own ed25519 SSH host key through the guest agent
+   (`agent/file-read` of `/etc/ssh/ssh_host_ed25519_key.pub`) and record it
+   as the `ssh_host_key` label in the VM description. See
+   [Attested SSH host keys](#attested-ssh-host-keys).
+7. Wait for SSH to come up, then run the Crabbox Linux bootstrap over SSH as
    root: it installs `openssh-server`, `ca-certificates`, `curl`, `git`,
    `rsync`, and `jq`, writes `/usr/local/bin/crabbox-ready`, and runs it.
-7. Sync the checkout and run commands over SSH.
-8. Touch the lease labels during runs; on release, delete the VM (stop, then
+8. Sync the checkout and run commands over SSH.
+9. Touch the lease labels during runs; on release, delete the VM (stop, then
    `DELETE ... ?purge=1`) unless the lease is kept.
 
 List, release reconciliation, and cleanup use cluster-wide inventory and follow

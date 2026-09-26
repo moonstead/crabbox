@@ -1165,7 +1165,20 @@ func (c *ProxmoxClient) CreateServerWithVMID(ctx context.Context, cfg Config, pu
 		cleanupClone()
 		return Server{}, err
 	}
-	if err := c.bootstrapSSH(ctx, server.PublicNet.IPv4.IP, cfg); err != nil {
+	// Learn the guest's host key from the hypervisor before the first SSH
+	// connection, and record it where the guest cannot change it. No SSH
+	// connection to this lease ever trusts a key on first use.
+	hostKey, err := c.waitGuestSSHHostKey(ctx, vmid)
+	if err != nil {
+		cleanupClone()
+		return Server{}, err
+	}
+	labels[ProxmoxSSHHostKeyLabel] = hostKey
+	if err := c.SetLabels(ctx, clonedVMID, labels); err != nil {
+		cleanupClone()
+		return Server{}, err
+	}
+	if err := c.bootstrapSSH(ctx, server.PublicNet.IPv4.IP, cfg, hostKey, leaseID); err != nil {
 		cleanupClone()
 		return Server{}, err
 	}
@@ -1210,11 +1223,14 @@ type proxmoxBootstrapError struct {
 func (e *proxmoxBootstrapError) Error() string { return e.message }
 func (e *proxmoxBootstrapError) Unwrap() error { return e.cause }
 
-func (c *ProxmoxClient) bootstrapSSH(ctx context.Context, host string, cfg Config) error {
+func (c *ProxmoxClient) bootstrapSSH(ctx context.Context, host string, cfg Config, hostKey, leaseID string) error {
 	if c.guestType() == ProxmoxGuestLXC {
 		return c.bootstrapLXCSSH(ctx, host, cfg)
 	}
 	target := SSHTargetFromConfig(cfg, host)
+	if err := PinProxmoxHostKey(&target, Server{Labels: map[string]string{ProxmoxSSHHostKeyLabel: hostKey}}, leaseID); err != nil {
+		return err
+	}
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
 		if proxmoxRunSSHQuietWithOptions(ctx, target, sshTransportProbeCommand(target), "5", "1") == nil {

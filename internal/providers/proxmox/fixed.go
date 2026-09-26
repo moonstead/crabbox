@@ -207,6 +207,9 @@ func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest
 			return core.LeaseTarget{}, err
 		}
 		target := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
+		if err := core.PinProxmoxHostKey(&target, server, leaseID); err != nil {
+			return core.LeaseTarget{}, err
+		}
 		if err := waitForSSHReadyFunc(ctx, &target, b.RT.Stderr, "bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
 			return core.LeaseTarget{}, err
 		}
