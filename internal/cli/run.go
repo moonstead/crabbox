@@ -5237,7 +5237,11 @@ func confirmedAbsentLocalStateSnapshot(ctx context.Context, backend Backend, exp
 			if err := retainer.ValidateConfirmedAbsentTerminalReceipt(claim, ConfirmedAbsentLocalCleanupRequest{ExpectedProviderIdentity: expected, ProviderScope: providerScope}); err != nil {
 				return confirmedAbsentLocalState{}, err
 			}
-			return confirmedAbsentLocalState{}, Exit(4, "fixed terminal receipt is missing before confirmed-absence cleanup")
+			// A provider may accept no claim only for an attempt the adapter never
+			// acknowledged. Once it learned a resource, the receipt must remain.
+			if expected.LeaseID != "" || expected.ResourceID != "" {
+				return confirmedAbsentLocalState{}, Exit(4, "fixed terminal receipt is missing before confirmed-absence cleanup")
+			}
 		}
 	}
 	retainTerminal := false

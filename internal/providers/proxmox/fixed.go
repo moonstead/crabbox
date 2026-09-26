@@ -451,6 +451,13 @@ func (b *leaseBackend) ValidateConfirmedAbsentTerminalReceipt(claim core.LeaseCl
 	}
 	claimScope := strings.TrimSpace(core.ProviderClaimScope("proxmox", b.Cfg))
 	unacknowledged := expected.LeaseID == "" && expected.ResourceID == ""
+	// A fixed attempt persists its claim, with its VMID, before cloning and
+	// loses it only to a definite rejection. With no claim at all, an attempt
+	// the adapter never acknowledged never had a VM and leaves nothing to keep.
+	if claim.LeaseID == "" && claim.FixedCreateIntent == nil && unacknowledged &&
+		expected.AttemptLeaseID != "" && expected.Slug != "" && req.ProviderScope == controllerScope {
+		return core.ValidateProviderIdentityExpectation(expected)
+	}
 	if expected.AttemptLeaseID == "" || expected.Slug == "" || !unacknowledged && (expected.LeaseID == "" || expected.ResourceID == "") ||
 		req.ProviderScope != controllerScope || claimScope == "" || claim.ProviderScope != claimScope {
 		return core.Exit(4, "Proxmox terminal receipt requires complete matching identity and scope")

@@ -566,11 +566,16 @@ without waiting for `--create-timeout`. A VM without a bound or matching
 generation is never reported, so its workspace stays `stopping` for inspection.
 
 When the adapter confirms that a released VM is absent, it finishes cleanup and
-keeps the released claim as the lease ID's receipt, as direct `stop` does. If an
-acquisition failed before Crabbox wrote that claim, confirmed-absence cleanup
-fails closed and the workspace stays `stopping` until an operator inspects it.
-This includes a definite clone rejection, which removes the claim so that the
-fixed ID can be retried.
+keeps the released claim as the lease ID's receipt, as direct `stop` does.
+
+An attempt can also end with no claim at all. Either it failed before Crabbox
+wrote the claim, or a definite clone rejection removed the claim so that the
+fixed ID can be retried. Crabbox writes the claim, with its VMID, before any
+clone, so such an attempt never had a VM. If the adapter never recorded an
+identity for it, cleanup finishes after the late-creation window without
+writing or deleting anything. If the adapter did record an identity, a missing
+receipt fails closed and the workspace stays `stopping` until an operator
+inspects it.
 
 If the adapter never recorded the VM's identity, for example because an
 operator released the attempt with `crabbox stop` or `crabbox stop --force`
