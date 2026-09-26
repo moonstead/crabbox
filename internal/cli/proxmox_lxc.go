@@ -233,7 +233,7 @@ func (c *ProxmoxClient) createLXCServer(ctx context.Context, cfg Config, publicK
 	if err != nil {
 		return Server{}, cleanup(err)
 	}
-	if err := c.bootstrapSSH(ctx, server.PublicNet.IPv4.IP, cfg); err != nil {
+	if err := c.bootstrapSSH(ctx, server.PublicNet.IPv4.IP, cfg, "", leaseID); err != nil {
 		return Server{}, cleanup(err)
 	}
 	server, err = c.GetServer(ctx, createdID)

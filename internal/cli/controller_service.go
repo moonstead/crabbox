@@ -105,13 +105,16 @@ type controllerWorkspaceRecord struct {
 	Provider                   string                     `json:"provider,omitempty"`
 	ProviderResourceID         string                     `json:"providerResourceId,omitempty"`
 	Host                       string                     `json:"host,omitempty"`
-	AttachURL                  string                     `json:"attachUrl,omitempty"`
-	Message                    string                     `json:"message"`
-	ExpiresAt                  string                     `json:"expiresAt,omitempty"`
-	ControllerExpiresAt        string                     `json:"controllerExpiresAt,omitempty"`
-	ProviderExpiresAt          string                     `json:"providerExpiresAt,omitempty"`
-	CreatedAt                  string                     `json:"createdAt"`
-	UpdatedAt                  string                     `json:"updatedAt"`
+	// The ready lease's SSH host key was attested by its provider, not
+	// trusted on first use, and every connection to it is checked strictly.
+	SSHHostKeyPinned    bool   `json:"sshHostKeyPinned,omitempty"`
+	AttachURL           string `json:"attachUrl,omitempty"`
+	Message             string `json:"message"`
+	ExpiresAt           string `json:"expiresAt,omitempty"`
+	ControllerExpiresAt string `json:"controllerExpiresAt,omitempty"`
+	ProviderExpiresAt   string `json:"providerExpiresAt,omitempty"`
+	CreatedAt           string `json:"createdAt"`
+	UpdatedAt           string `json:"updatedAt"`
 }
 
 type controllerWorkspaceResponse struct {
@@ -122,6 +125,7 @@ type controllerWorkspaceResponse struct {
 	Provider           string                                  `json:"provider,omitempty"`
 	ProviderResourceID string                                  `json:"providerResourceId,omitempty"`
 	Host               string                                  `json:"host,omitempty"`
+	SSHHostKeyPinned   bool                                    `json:"sshHostKeyPinned,omitempty"`
 	AttachURL          string                                  `json:"attachUrl,omitempty"`
 	Message            string                                  `json:"message"`
 	Capabilities       controllerWorkspaceResponseCapabilities `json:"capabilities"`
@@ -2191,6 +2195,7 @@ func (s *controllerService) markReady(id string, status StatusView) error {
 		record.Status = "ready"
 		record.Provider = record.ProviderRoute
 		record.Host = firstNonBlank(status.Host, status.SSHHost)
+		record.SSHHostKeyPinned = strings.TrimSpace(status.SSHHostKey) != ""
 		if strings.TrimSpace(status.ExpiresAt) != "" {
 			record.ProviderExpiresAt = status.ExpiresAt
 		}
@@ -2470,6 +2475,7 @@ func controllerResponse(record controllerWorkspaceRecord) controllerWorkspaceRes
 		Provider:           record.Provider,
 		ProviderResourceID: record.ProviderResourceID,
 		Host:               record.Host,
+		SSHHostKeyPinned:   record.SSHHostKeyPinned,
 		AttachURL:          record.AttachURL,
 		Message:            record.Message,
 		Capabilities: controllerWorkspaceResponseCapabilities{
