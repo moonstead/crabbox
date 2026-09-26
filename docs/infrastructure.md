@@ -166,6 +166,7 @@ DATABASE_URL                         # PostgreSQL connection string
 PORT                                 # optional; default 8080
 CRABBOX_PUBLIC_URL                   # canonical external origin
 CRABBOX_CODE_ORIGIN_TEMPLATE         # required for browser Code; https://{lease}.code.example.com
+CRABBOX_WEBVNC_EMBED_ORIGIN          # optional; the one origin allowed to frame the embedded WebVNC viewer
 CRABBOX_SHUTDOWN_TIMEOUT_MS          # optional; default 120000
 ```
 

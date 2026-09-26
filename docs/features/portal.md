@@ -26,6 +26,8 @@ POST /portal/leases/{id-or-slug}/share          add/remove user, set org, clear
 POST /portal/leases/{id-or-slug}/release        stop, delete via adapter, or remove registration
 POST /portal/leases/{id-or-slug}/vnc/bootstrap  consume an Agent viewer ticket
 GET  /portal/leases/{id-or-slug}/vnc            WebVNC viewer page
+POST /portal/leases/{id-or-slug}/vnc/embed/bootstrap  consume an embed viewer ticket
+GET  /portal/leases/{id-or-slug}/vnc/embed      unbranded WebVNC viewer for one embedding origin
 GET  /portal/leases/{id-or-slug}/code/...       code-server bridge (HTTP/WS proxy)
 GET  /portal/runs/{run-id}                       run detail
 GET  /portal/runs/{run-id}/logs                  retained log (text/plain)
@@ -117,6 +119,59 @@ viewer page suppresses those controls, and server authorization independently
 enforces the same restriction. Expiry, ticket replay, lease mismatch, principal
 mismatch, shared/admin token rotation, and grant revocation all fail closed.
 Existing GitHub Portal sessions remain unchanged.
+
+### Embedded viewer
+
+An application that already holds a shared or admin bearer token can show a
+desktop inside its own page without the portal shell. Embed mode is off until
+`CRABBOX_WEBVNC_EMBED_ORIGIN` names exactly one `https://` origin (or
+`http://localhost[:port]` for development). A value with a path, query,
+credentials, wildcard or more than one origin disables the mode again.
+
+The contract is the ticket flow above with `embed: true`:
+
+1. `POST /v1/leases/{id}/webvnc/viewer-bootstrap` with a bearer token and a
+   JSON body `{"credentialHandoffTicket": "...", "embed": true,
+   "takeControl": true}` returns `{ticket, leaseID, expiresAt, embed: true}`.
+   The ticket is one-use, expires after 120 seconds and is redeemable only at
+   the embed bootstrap. When embed mode is off the request fails with
+   `409 webvnc_embed_unavailable` and no ticket is stored.
+2. The application's page submits a form with a single field `ticket` to
+   `POST /portal/leases/{id}/vnc/embed/bootstrap`, targeting an `iframe` that
+   it owns. The ticket travels only in that POST body. The response consumes
+   the ticket, sets a `crabbox_webvnc_session` cookie with `HttpOnly; Secure;
+   SameSite=None; Partitioned` on the lease's `/vnc` path, and replaces the
+   frame's location with `GET /portal/leases/{id}/vnc/embed`. Any ticket
+   presented at the wrong bootstrap is rejected and burned.
+3. The embed page renders only the noVNC display and its own controls: status,
+   sizing, take control, clipboard, reconnect and fullscreen. It has no brand,
+   navigation, log out, share or bridge command and never names the lease.
+   Fullscreen inside a frame needs `allow="fullscreen"` on the `iframe`.
+   Reloading the frame reuses the same session and returns to the same desktop
+   until the session's 30-minute lifetime, the lease, the grant or the token
+   behind it ends.
+
+Every embed response answers with `frame-ancestors <configured origin>`; every
+portal response keeps `frame-ancestors 'none'`. The embed session opens
+nothing in the portal shell, a portal session opens nothing in the embed
+viewer, and each frame stays independent: embedded viewers never hand a
+session to another tab. Status, control, theme, handoff and the viewer
+WebSocket still require the coordinator's own origin, so the embedding page
+cannot call them, and it cannot read the cookie, the desktop credentials or
+the frame's history.
+
+The frame reports status only. When it is loaded without a valid session it
+answers `401` with a frameable notice instead of the login redirect, and the
+notice and the viewer post `{type: "crabbox-webvnc-embed", leaseID, state,
+message}` to `window.parent` with the configured origin as the only target.
+`state` is one of `session-required`, `unavailable`, `connected` and
+`disconnected`. On `session-required` the application mints a new ticket and
+repeats step 2; nothing in the message lets it do so by itself.
+
+Take control stays inside the authenticated viewer session, through
+`takeControl` at minting and the viewer's own button. This is where later
+viewer-session controls belong; the desktop's agent and the viewer still share
+one operating system user, so the embed contract claims no exclusive control.
 
 ```text
 session  authenticated GitHub user (owner / org embedded in the token)

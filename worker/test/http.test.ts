@@ -292,6 +292,62 @@ describe("coordinator auth", () => {
     expect(bootstrap.request.headers.has("x-crabbox-owner")).toBe(false);
     expect(bootstrap.request.headers.has("x-crabbox-auth")).toBe(false);
 
+    const embedBootstrap = await prepareCoordinatorRequest(
+      new Request(
+        "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed/bootstrap",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            origin: "https://bb.example.test",
+            cookie: sessionCookie,
+            "x-crabbox-owner": "forged@example.test",
+          },
+          body: "ticket=webvnc_view_0123456789abcdef0123456789abcdef",
+        },
+      ),
+      env,
+    );
+    expect(embedBootstrap).toMatchObject({ authenticated: false });
+    if ("response" in embedBootstrap) {
+      throw new Error("embedded WebVNC viewer bootstrap did not reach the coordinator");
+    }
+    expect(embedBootstrap.request.headers.has("x-crabbox-owner")).toBe(false);
+    expect(embedBootstrap.request.headers.has("x-crabbox-auth")).toBe(false);
+
+    // The embed page reaches the coordinator without any session so it can
+    // render a frameable notice rather than a portal login redirect.
+    const embedPage = await prepareCoordinatorRequest(
+      new Request("https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed", {
+        headers: { "x-crabbox-owner": "forged@example.test" },
+      }),
+      env,
+    );
+    expect(embedPage).toMatchObject({ authenticated: false });
+    if ("response" in embedPage) {
+      throw new Error("embedded WebVNC viewer page did not reach the coordinator");
+    }
+    expect(embedPage.request.headers.has("x-crabbox-owner")).toBe(false);
+    expect(embedPage.request.headers.has("x-crabbox-auth")).toBe(false);
+
+    const nearMisses = [
+      "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed/",
+      "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embedx",
+      "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed/status",
+    ];
+    const nearMissResults = await Promise.all(
+      nearMisses.map(async (url) => ({
+        url,
+        prepared: await prepareCoordinatorRequest(new Request(url), env),
+      })),
+    );
+    for (const { url, prepared } of nearMissResults) {
+      expect({ url, prepared }).toMatchObject({
+        url,
+        prepared: { authenticated: false, response: { status: 302 } },
+      });
+    }
+
     const page = await prepareCoordinatorRequest(
       new Request("https://broker.example.test/portal/leases/cbx_000000000001/vnc", {
         headers: { cookie: `crabbox_session=existing-github-session; ${sessionCookie}` },
@@ -1700,6 +1756,66 @@ describe("coordinator auth", () => {
     );
     expect(bootstrapBody).toContain('value="webvnc_view_0123456789abcdef0123456789abcdef"');
     expect(bootstrapBody).toContain('document.getElementById("webvnc-bootstrap").requestSubmit()');
+    expect(fleetCalled).toBe(false);
+  });
+
+  it("keeps the non-canonical embed bootstrap flash page frameable only by the embed origin", async () => {
+    let fleetCalled = false;
+    const fleetBinding = {
+      idFromName: () => "default",
+      get: () => {
+        fleetCalled = true;
+        return { fetch: () => new Response("unexpected", { status: 599 }) };
+      },
+    };
+    const request = (): Request =>
+      new Request(
+        "https://crabbox-coordinator.steipete.workers.dev/portal/leases/cbx_1/vnc/embed/bootstrap",
+        {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: "ticket=webvnc_view_0123456789abcdef0123456789abcdef",
+        },
+      );
+
+    const embedded = await coordinator.fetch(request(), {
+      CRABBOX_PUBLIC_URL: "https://broker.example.com",
+      CRABBOX_WEBVNC_EMBED_ORIGIN: "https://bb.example.test",
+      FLEET: fleetBinding,
+    } as unknown as Env);
+    expect(embedded.status).toBe(200);
+    expect(embedded.headers.get("content-security-policy")).toContain(
+      "frame-ancestors https://bb.example.test",
+    );
+    expect(embedded.headers.get("content-security-policy")).toContain(
+      "form-action https://broker.example.com",
+    );
+    expect(await embedded.text()).toContain(
+      'action="https://broker.example.com/portal/leases/cbx_1/vnc/embed/bootstrap"',
+    );
+
+    const unconfigured = await coordinator.fetch(request(), {
+      CRABBOX_PUBLIC_URL: "https://broker.example.com",
+      FLEET: fleetBinding,
+    } as unknown as Env);
+    expect(unconfigured.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+
+    const portal = await coordinator.fetch(
+      new Request(
+        "https://crabbox-coordinator.steipete.workers.dev/portal/leases/cbx_1/vnc/bootstrap",
+        {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: "ticket=webvnc_view_0123456789abcdef0123456789abcdef",
+        },
+      ),
+      {
+        CRABBOX_PUBLIC_URL: "https://broker.example.com",
+        CRABBOX_WEBVNC_EMBED_ORIGIN: "https://bb.example.test",
+        FLEET: fleetBinding,
+      } as unknown as Env,
+    );
+    expect(portal.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
     expect(fleetCalled).toBe(false);
   });
 });

@@ -316,6 +316,7 @@ import {
   portalRunDetail,
   portalShareLease,
   portalVNC,
+  portalVNCEmbedNotice,
   type PortalAdminLeaseSummary,
   type PortalLeaseBridgeStatus,
   type PortalAdminProviderStatus,
@@ -472,6 +473,7 @@ import {
   type CostLimitUsage,
   type OwnerCapacity,
 } from "./usage";
+import { webVNCEmbedOrigin } from "./webvnc-embed";
 import { WebVNCCredentialHandoffs, type WebVNCCredentialHandoffResult } from "./webvnc-handoff";
 
 const fleetID = "default";
@@ -633,13 +635,19 @@ interface PortalViewerSessionRecord extends PortalViewerPrincipalRecord {
 interface WebVNCPortalViewerTicketRecord extends PortalViewerTicketRecord {
   credentialHandoffTicket?: string;
   takeControl?: boolean;
+  /** Redeemable only at the embed bootstrap; absent for portal tickets. */
+  embed?: true;
 }
 
 interface WebVNCPortalViewerSessionRecord extends PortalViewerSessionRecord {
   credentialHandoffTicket?: string;
   credentialStorageID?: string;
   takeControl?: boolean;
+  /** Opens only the unbranded embed viewer, never the portal viewer page. */
+  embed?: true;
 }
+
+type WebVNCPortalViewerMode = "portal" | "embed";
 
 interface NativeVNCTicketRecord {
   ticket: string;
@@ -8673,6 +8681,7 @@ export class FleetCoordinator {
       parts[2] &&
       parts[3] === "vnc" &&
       parts[4] !== "bootstrap" &&
+      !(parts[4] === "embed" && parts[5] === "bootstrap") &&
       webVNCViewerSessionCookie &&
       !request.headers.has("x-crabbox-auth")
     ) {
@@ -8682,7 +8691,9 @@ export class FleetCoordinator {
         webVNCViewerSessionCookie,
       );
       if (!webVNCViewerSession) {
-        return this.webVNCPortalViewerAuthenticationRequired(request);
+        return method === "GET" && parts[4] === "embed" && parts[5] === undefined
+          ? this.webVNCEmbedViewerNotice(request, parts[2], "session-required")
+          : this.webVNCPortalViewerAuthenticationRequired(request);
       }
       request = webVNCPortalViewerRequest(request, webVNCViewerSession);
     }
@@ -8799,12 +8810,37 @@ export class FleetCoordinator {
       return await this.bootstrapWebVNCPortalViewer(request, parts[2]);
     }
     if (
+      method === "POST" &&
+      parts[1] === "leases" &&
+      parts[2] &&
+      parts[3] === "vnc" &&
+      parts[4] === "embed" &&
+      parts[5] === "bootstrap" &&
+      parts[6] === undefined
+    ) {
+      return await this.bootstrapWebVNCPortalViewer(request, parts[2], "embed");
+    }
+    if (
+      method === "GET" &&
+      parts[1] === "leases" &&
+      parts[2] &&
+      parts[3] === "vnc" &&
+      parts[4] === "embed" &&
+      parts[5] === undefined
+    ) {
+      return await this.webVNCEmbedViewerPage(request, parts[2], webVNCViewerSession);
+    }
+    if (
       method === "GET" &&
       parts[1] === "leases" &&
       parts[2] &&
       parts[3] === "vnc" &&
       parts[4] === undefined
     ) {
+      if (webVNCViewerSession?.embed) {
+        // An embed session opens nothing outside its frameable viewer.
+        return this.webVNCPortalViewerAuthenticationRequired(request);
+      }
       const lease = await this.resolvePortalLease(parts[2], request);
       if (!lease) {
         return portalError(
@@ -8881,6 +8917,71 @@ export class FleetCoordinator {
       return await this.codePortalProxy(request, parts[2], parts.slice(4));
     }
     return json({ error: "not_found" }, { status: 404 });
+  }
+
+  private webVNCEmbedViewerNotice(
+    request: Request,
+    identifier: string,
+    state: "session-required" | "unavailable",
+    message?: string,
+    status?: number,
+  ): Response {
+    const origin = webVNCEmbedOrigin(this.env);
+    if (!origin) {
+      return json({ error: "not_found" }, { status: 404 });
+    }
+    const response = portalVNCEmbedNotice({
+      leaseID: identifier,
+      state,
+      ...(message ? { message } : {}),
+      ...(status ? { status } : {}),
+      frameAncestors: origin,
+      origin,
+    });
+    if (state === "session-required") {
+      response.headers.append("set-cookie", clearWebVNCPortalViewerSessionCookie(request, "embed"));
+    }
+    return response;
+  }
+
+  private async webVNCEmbedViewerPage(
+    request: Request,
+    identifier: string,
+    session: WebVNCPortalViewerSessionRecord | undefined,
+  ): Promise<Response> {
+    const origin = webVNCEmbedOrigin(this.env);
+    if (!origin) {
+      return json({ error: "not_found" }, { status: 404 });
+    }
+    if (!session || session.embed !== true) {
+      return this.webVNCEmbedViewerNotice(request, identifier, "session-required");
+    }
+    const lease = await this.resolvePortalLease(identifier, request);
+    if (!lease) {
+      return this.webVNCEmbedViewerNotice(
+        request,
+        identifier,
+        "unavailable",
+        "That desktop is not active or is not visible to you.",
+        404,
+      );
+    }
+    const error = webVNCLeaseError(lease);
+    if (error) {
+      return this.webVNCEmbedViewerNotice(request, identifier, "unavailable", error, 409);
+    }
+    return portalVNC(publicLeaseRecord(lease), {
+      canManage: false,
+      viewerOnly: true,
+      sessionCredentialHandoff: Boolean(
+        session.credentialHandoffTicket || session.credentialStorageID,
+      ),
+      ...(session.credentialStorageID
+        ? { sessionCredentialStorageID: session.credentialStorageID }
+        : {}),
+      takeControl: session.takeControl === true,
+      embed: { frameAncestors: origin, origin },
+    });
   }
 
   private async portalLeases(request: Request): Promise<LeaseRecord[]> {
@@ -11171,6 +11272,7 @@ export class FleetCoordinator {
     const input = await optionalJson<{
       credentialHandoffTicket?: unknown;
       takeControl?: unknown;
+      embed?: unknown;
     }>(request);
     const credentialHandoffTicket =
       typeof input.credentialHandoffTicket === "string" ? input.credentialHandoffTicket.trim() : "";
@@ -11178,6 +11280,19 @@ export class FleetCoordinator {
       return json(
         { error: "invalid_handoff", message: "valid VNC credential handoff required" },
         { status: 400 },
+      );
+    }
+    if (input.embed !== undefined && input.embed !== true && input.embed !== false) {
+      return json({ error: "invalid_embed", message: "embed must be a boolean" }, { status: 400 });
+    }
+    const embed = input.embed === true;
+    if (embed && !webVNCEmbedOrigin(this.env)) {
+      return json(
+        {
+          error: "webvnc_embed_unavailable",
+          message: "embedded WebVNC viewer is not enabled; set CRABBOX_WEBVNC_EMBED_ORIGIN",
+        },
+        { status: 409 },
       );
     }
     const now = new Date();
@@ -11191,6 +11306,7 @@ export class FleetCoordinator {
       ...bridgeGrant,
       ...(credentialHandoffTicket ? { credentialHandoffTicket } : {}),
       ...(input.takeControl === true ? { takeControl: true } : {}),
+      ...(embed ? { embed: true as const } : {}),
       createdAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + webVNCPortalViewerTicketTTLSeconds * 1000).toISOString(),
     };
@@ -11207,6 +11323,7 @@ export class FleetCoordinator {
         ticket: ticket.ticket,
         leaseID: ticket.leaseID,
         expiresAt: ticket.expiresAt,
+        ...(ticket.embed ? { embed: true } : {}),
       },
       { headers: { "cache-control": "no-store" } },
     );
@@ -11215,7 +11332,12 @@ export class FleetCoordinator {
   private async bootstrapWebVNCPortalViewer(
     request: Request,
     identifier: string,
+    mode: WebVNCPortalViewerMode = "portal",
   ): Promise<Response> {
+    const embedOrigin = mode === "embed" ? webVNCEmbedOrigin(this.env) : undefined;
+    if (mode === "embed" && !embedOrigin) {
+      return json({ error: "not_found" }, { status: 404 });
+    }
     const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
     if (contentType !== "application/x-www-form-urlencoded") {
       return json(
@@ -11227,7 +11349,7 @@ export class FleetCoordinator {
       );
     }
     const value = new URLSearchParams(await request.text()).get("ticket") ?? "";
-    const ticket = await this.consumeWebVNCPortalViewerTicket(value, identifier);
+    const ticket = await this.consumeWebVNCPortalViewerTicket(value, identifier, mode);
     if (!ticket) {
       return json(
         {
@@ -11267,12 +11389,16 @@ export class FleetCoordinator {
           }
         : {}),
       ...(ticket.takeControl ? { takeControl: true } : {}),
+      ...(ticket.embed ? { embed: true as const } : {}),
       createdAt: now.toISOString(),
       expiresAt: new Date(expiresAt).toISOString(),
     };
     await this.state.storage.put(webVNCPortalViewerSessionKey(session.session), session);
     await this.scheduleAlarm();
-    const location = `/portal/leases/${encodeURIComponent(ticket.leaseID)}/vnc`;
+    const location = `/portal/leases/${encodeURIComponent(ticket.leaseID)}/vnc${
+      ticket.embed ? "/embed" : ""
+    }`;
+    const frameAncestors = ticket.embed && embedOrigin ? embedOrigin : "'none'";
     const nonce = randomHexToken("");
     return new Response(
       // Palette: vendored carapace v0.6.1 neutral product tokens; self-contained flash page.
@@ -11281,7 +11407,7 @@ export class FleetCoordinator {
         status: 200,
         headers: {
           "cache-control": "no-store",
-          "content-security-policy": `default-src 'none'; base-uri 'none'; frame-ancestors 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
+          "content-security-policy": `default-src 'none'; base-uri 'none'; frame-ancestors ${frameAncestors}; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
           "content-type": "text/html; charset=utf-8",
           "referrer-policy": "no-referrer",
           "set-cookie": webVNCPortalViewerSessionCookie(session),
@@ -11294,6 +11420,7 @@ export class FleetCoordinator {
   private async consumeWebVNCPortalViewerTicket(
     value: string,
     identifier: string,
+    mode: WebVNCPortalViewerMode,
   ): Promise<WebVNCPortalViewerTicketRecord | undefined> {
     if (!validWebVNCPortalViewerTicket(value)) {
       return undefined;
@@ -11305,6 +11432,11 @@ export class FleetCoordinator {
         return undefined;
       }
       await this.state.storage.delete(key);
+      // A ticket is bound to the bootstrap it was minted for. Redeeming it at
+      // the other one still burns it, so a leaked ticket cannot be retried.
+      if ((ticket.embed === true) !== (mode === "embed")) {
+        return undefined;
+      }
       if (
         !isCurrentOrgKey(ticket.org) ||
         Date.parse(ticket.expiresAt) <= Date.now() ||
@@ -24001,25 +24133,34 @@ function codeViewerSessionCookies(
   ];
 }
 
+// An embed session lives inside a cross-site iframe, so its cookie needs
+// SameSite=None. Partitioned keys it to the embedding site: the cookie never
+// reaches a top-level portal navigation and survives third-party cookie
+// blocking only within that one embedding site.
+function webVNCPortalViewerSessionCookieAttributes(mode: WebVNCPortalViewerMode): string[] {
+  return mode === "embed"
+    ? ["HttpOnly", "Secure", "SameSite=None", "Partitioned"]
+    : ["HttpOnly", "Secure", "SameSite=Strict"];
+}
+
 function webVNCPortalViewerSessionCookie(session: WebVNCPortalViewerSessionRecord): string {
   return [
     `crabbox_webvnc_session=${encodeURIComponent(session.session)}`,
     `Path=/portal/leases/${encodeURIComponent(session.leaseID)}/vnc`,
-    "HttpOnly",
-    "Secure",
-    "SameSite=Strict",
+    ...webVNCPortalViewerSessionCookieAttributes(session.embed ? "embed" : "portal"),
   ].join("; ");
 }
 
-function clearWebVNCPortalViewerSessionCookie(request: Request): string {
+function clearWebVNCPortalViewerSessionCookie(
+  request: Request,
+  mode: WebVNCPortalViewerMode = "portal",
+): string {
   const match = /^(\/portal\/leases\/[^/]+\/vnc)(?:\/|$)/.exec(new URL(request.url).pathname);
   const path = match?.[1] ?? "/portal";
   return [
     "crabbox_webvnc_session=",
     `Path=${path}`,
-    "HttpOnly",
-    "Secure",
-    "SameSite=Strict",
+    ...webVNCPortalViewerSessionCookieAttributes(mode),
     "Max-Age=0",
   ].join("; ");
 }

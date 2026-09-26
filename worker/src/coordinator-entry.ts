@@ -25,6 +25,7 @@ import {
 import { runtimeAdapterProxyPath, runtimeAdapterRelayMethodAllowed } from "./runtime-adapter-relay";
 import { timingSafeEqual } from "./timing-safe";
 import type { Env } from "./types";
+import { webVNCEmbedFrameAncestors } from "./webvnc-embed";
 
 export type CoordinatorFetch = (request: Request) => Promise<Response>;
 export type PreparedCoordinatorRequest =
@@ -157,7 +158,11 @@ export async function prepareCoordinatorRequest(
       authenticated: false,
     };
   }
-  if (isWebVNCViewerBootstrap(request, url) || isWebVNCViewerSessionRequest(request, url)) {
+  if (
+    isWebVNCViewerBootstrap(request, url) ||
+    isWebVNCViewerSessionRequest(request, url) ||
+    isWebVNCEmbedViewerPage(request, url)
+  ) {
     return {
       request: await requestWithAdminGrantVersion(
         requestWithoutCoordinatorAuthContext(request),
@@ -266,7 +271,26 @@ function portalCookieRequestIntentAllowed(request: Request, env: Env, url: URL):
 function isWebVNCViewerBootstrap(request: Request, url: URL): boolean {
   return (
     request.method.toUpperCase() === "POST" &&
-    /^\/portal\/leases\/[^/]+\/vnc\/bootstrap$/.test(url.pathname)
+    /^\/portal\/leases\/[^/]+\/vnc(?:\/embed)?\/bootstrap$/.test(url.pathname)
+  );
+}
+
+function isWebVNCEmbedViewerBootstrap(request: Request, url: URL): boolean {
+  return (
+    request.method.toUpperCase() === "POST" &&
+    /^\/portal\/leases\/[^/]+\/vnc\/embed\/bootstrap$/.test(url.pathname)
+  );
+}
+
+// The embed page answers without a viewer session too: it then renders a
+// frameable "session required" page instead of the portal login redirect, so
+// an embedding application can mint a fresh one-use ticket.
+function isWebVNCEmbedViewerPage(request: Request, url: URL): boolean {
+  return (
+    request.method.toUpperCase() === "GET" &&
+    request.headers.get("upgrade")?.toLowerCase() !== "websocket" &&
+    !request.headers.has("authorization") &&
+    /^\/portal\/leases\/[^/]+\/vnc\/embed$/.test(url.pathname)
   );
 }
 
@@ -277,7 +301,7 @@ function isWebVNCViewerSessionRequest(request: Request, url: URL): boolean {
   const session = cookieValue(request.headers.get("cookie") ?? "", "crabbox_webvnc_session");
   return (
     /^webvnc_session_[a-f0-9]{32}$/.test(session) &&
-    /^\/portal\/leases\/[^/]+\/vnc(?:\/(?:status|control|theme|handoff|viewer))?$/.test(
+    /^\/portal\/leases\/[^/]+\/vnc(?:\/(?:status|control|theme|handoff|viewer|embed))?$/.test(
       url.pathname,
     )
   );
@@ -374,6 +398,9 @@ async function canonicalPortalRedirect(
         : "";
     if (/^webvnc_view_[a-f0-9]{32}$/.test(ticket)) {
       const nonce = crypto.randomUUID().replaceAll("-", "");
+      const frameAncestors = isWebVNCEmbedViewerBootstrap(request, url)
+        ? webVNCEmbedFrameAncestors(env)
+        : "'none'";
       return new Response(
         // Palette: vendored carapace v0.6.1 neutral product tokens; self-contained flash page.
         `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Opening WebVNC</title><style nonce="${nonce}">:root{color-scheme:dark light;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{min-height:100vh;margin:0;display:grid;place-items:center;background:#0d0b0b;color:#f4f1ef}form{text-align:center}button{font:inherit;font-weight:700;padding:.55rem 1rem;border:1px solid transparent;border-radius:.5rem;background:#ff8a5f;color:#15100e;cursor:pointer}@media (prefers-color-scheme:light){body{background:#fbfaf7;color:#171514}button{background:#d75a37;color:#fff}}</style></head><body><form id="webvnc-bootstrap" method="post" action="${escapeHTMLAttribute(location.toString())}" autocomplete="off"><input type="hidden" name="ticket" value="${escapeHTMLAttribute(ticket)}"><p>Opening WebVNC...</p><button type="submit">Continue</button></form><script nonce="${nonce}">document.getElementById("webvnc-bootstrap").requestSubmit()</script></body></html>`,
@@ -381,7 +408,7 @@ async function canonicalPortalRedirect(
           status: 200,
           headers: {
             "cache-control": "no-store",
-            "content-security-policy": `default-src 'none'; base-uri 'none'; form-action ${publicURL.origin}; frame-ancestors 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
+            "content-security-policy": `default-src 'none'; base-uri 'none'; form-action ${publicURL.origin}; frame-ancestors ${frameAncestors}; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
             "content-type": "text/html; charset=utf-8",
             "referrer-policy": "no-referrer",
             "x-content-type-options": "nosniff",

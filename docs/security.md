@@ -396,12 +396,21 @@ require an exact same-origin browser `Origin` matching `CRABBOX_PUBLIC_URL` (or
 the request origin when no public URL is configured). Missing or sibling-origin
 intent is rejected before the portal cookie is converted into bearer authority;
 explicit bearer API clients remain independent of this browser-only boundary.
-The one-use WebVNC bootstrap POST is the narrow exception: it may arrive from
-the CLI's file-origin bootstrap page or another application's page, including
-with a viewer cookie left by an earlier open, and it authorizes only by
-consuming the opaque, lease-bound ticket, which also replaces that cookie.
-Subsequent scoped-cookie mutations and viewer upgrades return to the exact
-same-origin requirement.
+The one-use WebVNC bootstrap POSTs, portal and embed, are the narrow exception:
+they may arrive from the CLI's file-origin bootstrap page or another
+application's page, including with a viewer cookie left by an earlier open,
+and each authorizes only by consuming the opaque, lease-bound ticket, which
+also replaces that cookie. Subsequent scoped-cookie mutations and viewer
+upgrades return to the exact same-origin requirement.
+
+Every portal page answers with `frame-ancestors 'none'`. Only the embedded
+WebVNC viewer under `/vnc/embed` may be framed, only by the single origin in
+`CRABBOX_WEBVNC_EMBED_ORIGIN`, and only through a ticket minted with
+`embed: true`. Its session cookie is `SameSite=None; Partitioned`, so it exists
+only inside that embedding site and never reaches a top-level portal
+navigation. The frame posts status words to that origin and nothing else; the
+embedding page cannot read the cookie, the desktop credentials, the frame's
+history or call the session's own routes from its origin.
 Portal logout follows the same boundary: `GET /portal/logout` only renders a
 confirmation page, and only a same-origin `POST` clears the portal cookie and
 revokes all WebVNC, Code, and mediated-egress bridges bound to that portal

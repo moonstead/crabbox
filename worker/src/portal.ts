@@ -8,6 +8,7 @@ import type {
   RunRecord,
 } from "./types";
 import { coordinatorProviderSpec } from "./types";
+import { webVNCEmbedMessageType } from "./webvnc-embed";
 
 const novncModuleURL = "/portal/assets/novnc/rfb.js";
 const copyIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>`;
@@ -1028,6 +1029,13 @@ export function webVNCCredentialsFromHistoryState(
   return { username: record["username"], password: record["password"] };
 }
 
+export interface PortalVNCEmbedOptions {
+  /** The exact origin allowed to frame the viewer. */
+  frameAncestors: string;
+  /** The only targetOrigin the viewer posts status messages to. */
+  origin: string;
+}
+
 export function portalVNC(
   lease: LeaseRecord,
   options: {
@@ -1036,12 +1044,15 @@ export function portalVNC(
     sessionCredentialHandoff?: boolean;
     sessionCredentialStorageID?: string;
     takeControl?: boolean;
+    /** Unbranded viewer for one configured embedding origin. */
+    embed?: PortalVNCEmbedOptions;
   } = {},
 ): Response {
   const nonce = scriptNonce();
   const slug = lease.slug || lease.id;
   const target = lease.target || "linux";
-  const title = `WebVNC ${slug}`;
+  const embed = options.embed;
+  const title = embed ? "Desktop" : `WebVNC ${slug}`;
   const wsPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/viewer`;
   const statusPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/status`;
   const controlPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/control`;
@@ -1079,13 +1090,7 @@ export function portalVNC(
   const fullscreenIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5"/><path d="M20 9V4h-5"/><path d="M4 15v5h5"/><path d="M20 15v5h-5"/></svg>`;
   const reconnectIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>`;
   const pasteIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2h6a2 2 0 0 1 2 2v1H7V4a2 2 0 0 1 2-2Z"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11v6"/><path d="m9 14 3 3 3-3"/></svg>`;
-  return html(
-    title,
-    `<main class="vnc-page">
-      ${portalHeader({
-        variant: "bar",
-        meta: `<span>WebVNC ${escapeHTML(slug)}</span><span class="vnc-dot"></span>${providerBadge(lease.provider)}<span class="vnc-dot"></span>${targetBadge(target, lease.windowsMode)}<span class="vnc-dot"></span><span class="vnc-id">${escapeHTML(lease.id)}</span>`,
-        actions: `
+  const viewerControls = `
           <span id="status" class="status-pill">waiting for bridge</span>
           <select id="vnc-sizing" aria-label="desktop sizing" title="Match requests the window size from a supported server; Fit scales without resizing. Wayland sizing stays with the first resizing viewer until it disconnects.">
             <option value="match"${target === "linux" ? " selected" : ""}>Match window</option>
@@ -1095,11 +1100,23 @@ export function portalVNC(
           <button id="vnc-copy-remote" class="icon-btn" type="button" title="copy remote clipboard" aria-label="copy remote clipboard" disabled>${copyIcon}</button>
           <button id="vnc-paste" class="icon-btn" type="button" title="paste clipboard" aria-label="paste clipboard">${pasteIcon}</button>
           <button id="vnc-reconnect" class="icon-btn" type="button" title="reconnect" aria-label="reconnect">${reconnectIcon}</button>
-          <button id="vnc-fullscreen" class="icon-btn" type="button" title="fullscreen" aria-label="toggle fullscreen">${fullscreenIcon}</button>
+          <button id="vnc-fullscreen" class="icon-btn" type="button" title="fullscreen" aria-label="toggle fullscreen">${fullscreenIcon}</button>`;
+  // The embed bar carries only the viewer's own controls: no brand, no theme
+  // toggle, no portal navigation and no lease identifiers.
+  const header = embed
+    ? `<header class="vnc-bar vnc-embed-bar"><div class="portal-actions">${viewerControls}</div></header>`
+    : portalHeader({
+        variant: "bar",
+        meta: `<span>WebVNC ${escapeHTML(slug)}</span><span class="vnc-dot"></span>${providerBadge(lease.provider)}<span class="vnc-dot"></span>${targetBadge(target, lease.windowsMode)}<span class="vnc-dot"></span><span class="vnc-id">${escapeHTML(lease.id)}</span>`,
+        actions: `${viewerControls}
           ${canManage ? `<button id="vnc-share" class="oc-action oc-action-outline" type="button">share</button>` : ""}
           ${viewerOnly ? "" : `<a class="oc-action oc-action-outline" href="/portal">leases</a>${portalLogoutButton()}`}
         `,
-      })}
+      });
+  return html(
+    title,
+    `<main class="vnc-page${embed ? " vnc-embed" : ""}">
+      ${header}
       <div class="vnc-display">
         <p id="vnc-sizing-notice" class="vnc-sizing-notice" role="status" hidden>Wayland sizing may remain owned by the previous viewer. Close that viewer, then reconnect.</p>
         <section id="screen" class="screen" aria-label="WebVNC display" tabindex="0"></section>
@@ -1198,6 +1215,17 @@ export function portalVNC(
         }
       }
       const takeControlOnConnect = ${JSON.stringify(options.takeControl === true)} || fragment.get("control") === "take";
+      const embedMode = ${JSON.stringify(Boolean(embed))};
+      const embedOrigin = ${JSON.stringify(embed?.origin ?? "")};
+      const embedMessageType = ${JSON.stringify(webVNCEmbedMessageType)};
+      // Status only: the embedding page never receives credentials, tickets,
+      // session values or URLs, and only the configured origin can receive it.
+      function notifyEmbedHost(state, message = "") {
+        if (!embedMode || !embedOrigin || window.parent === window) return;
+        try {
+          window.parent.postMessage({ type: embedMessageType, leaseID: ${JSON.stringify(lease.id)}, state, message: String(message || "") }, embedOrigin);
+        } catch (_) {}
+      }
       const reuseWindowName = "crabbox-webvnc-" + ${JSON.stringify(lease.id)};
       const reuseChannel = typeof BroadcastChannel === "function" ? new BroadcastChannel(reuseWindowName) : null;
       let portalReadyForReuse = false;
@@ -1289,6 +1317,8 @@ export function portalVNC(
         }
       });
       async function reuseExistingWebVNCTab() {
+        // Embedded viewers stay independent: each frame keeps its own session.
+        if (embedMode) return false;
         if ((!handoffTicket && !viewerBootstrapSession) || !reuseChannel) return false;
         const requestID = viewerID;
         const offered = new URLSearchParams({ handoff: handoffTicket });
@@ -1484,6 +1514,9 @@ export function portalVNC(
               return await response.json();
             }
             const message = await responseMessage(response, "WebVNC bridge unavailable");
+            if (embedMode && response.status === 401) {
+              return { terminal: true, sessionRequired: true, message: "Desktop session expired" };
+            }
             if (terminalStatusCodes.has(response.status)) {
               return { terminal: true, message };
             }
@@ -1646,6 +1679,7 @@ export function portalVNC(
           if (state?.controllerID) controllerID = state.controllerID;
           if (state?.terminal) {
             stopPolling(state.message || "WebVNC bridge unavailable");
+            notifyEmbedHost(state.sessionRequired ? "session-required" : "unavailable", state.message);
             return;
           }
           if (state?.transient) {
@@ -1679,6 +1713,7 @@ export function portalVNC(
             if (!current()) return;
             connected = true;
             retryAttempt = 0;
+            notifyEmbedHost("connected");
             setStatus("connected", "ok");
             queueDesktopTheme();
             void refreshCollaborationStateAndMaybeTakeControl().then(focusVNC).catch(() => {});
@@ -1701,6 +1736,7 @@ export function portalVNC(
             if (!current()) return;
             const wasConnected = connected;
             retireConnection();
+            if (wasConnected) notifyEmbedHost("disconnected");
             if (!wasConnected && (authenticationFailed || credentialsSent)) {
               stopPolling(authenticationFailed ? failedVNCCredentialMessage : "VNC authentication timed out; reopen WebVNC from crabbox webvnc status");
               return;
@@ -2094,14 +2130,58 @@ export function portalVNC(
           window.close();
           return;
         }
-        window.name = reuseWindowName;
-        portalReadyForReuse = true;
+        if (!embedMode) {
+          window.name = reuseWindowName;
+          portalReadyForReuse = true;
+        }
         connect();
       }
       void startViewer();
     </script>`,
     200,
     nonce,
+    embed ? { frameAncestors: embed.frameAncestors } : {},
+  );
+}
+
+/**
+ * A frameable notice for the embed viewer when it cannot show a desktop. It
+ * tells the embedding origin why, so it can mint a fresh one-use ticket, and
+ * carries no credential, ticket, session or portal link.
+ */
+export function portalVNCEmbedNotice(options: {
+  leaseID: string;
+  state: "session-required" | "unavailable";
+  message?: string;
+  status?: number;
+  frameAncestors: string;
+  origin: string;
+}): Response {
+  const nonce = scriptNonce();
+  const message =
+    options.message ||
+    (options.state === "session-required"
+      ? "This desktop session has ended. Reopen the desktop to continue."
+      : "This desktop is unavailable.");
+  const status = options.status ?? (options.state === "session-required" ? 401 : 409);
+  const payload = {
+    type: webVNCEmbedMessageType,
+    leaseID: options.leaseID,
+    state: options.state,
+    message,
+  };
+  return new Response(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Desktop</title><style nonce="${nonce}">:root{color-scheme:dark light;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{min-height:100vh;margin:0;display:grid;place-items:center;background:#0d0b0b;color:#f4f1ef}p{margin:0;padding:0 16px;text-align:center}@media (prefers-color-scheme:light){body{background:#fbfaf7;color:#171514}}</style></head><body><p role="status">${escapeHTML(message)}</p><script nonce="${nonce}">if(window.parent!==window){try{window.parent.postMessage(${scriptJSON(payload)},${JSON.stringify(options.origin)})}catch(_){}}</script></body></html>`,
+    {
+      status,
+      headers: {
+        "cache-control": "no-store",
+        "content-security-policy": `default-src 'none'; base-uri 'none'; frame-ancestors ${options.frameAncestors}; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
+        "content-type": "text/html; charset=utf-8",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+      },
+    },
   );
 }
 
@@ -3762,6 +3842,8 @@ function html(
     .vnc-meta .vnc-dot { width:3px; height:3px; border-radius:50%; background:var(--hover-line); flex-shrink:0; }
     .portal-actions { display:flex; align-items:center; justify-content:flex-end; gap:6px; flex-shrink:0; flex-wrap:wrap; }
     .vnc-bar .portal-actions { flex-shrink:1; max-width:100%; }
+    .vnc-page.vnc-embed { padding:0 8px 8px; gap:8px; }
+    .vnc-embed-bar { justify-content:flex-end; min-height:40px; padding:4px 8px; box-shadow:none; }
     .status-pill { display:inline-flex; align-items:center; gap:8px; height:32px; padding:0 12px 0 11px; border-radius:7px; background:var(--panel-2); border:1px solid var(--line); font-size:12px; color:var(--muted); white-space:nowrap; transition:color 0.2s, border-color 0.2s; }
     .status-pill::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; box-shadow:0 0 0 3px color-mix(in srgb, currentColor 18%, transparent); flex-shrink:0; }
     .status-pill[data-tone="ok"] { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 35%, var(--line)); }
