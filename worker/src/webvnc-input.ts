@@ -8,6 +8,12 @@ import { base64URL } from "./encoding";
 // binding derived from the lease and the viewer session. Take and return
 // requests come from an authenticated viewer through the coordinator; a
 // viewer's own input_* frames are reserved and never reach the bridge.
+//
+// Every answer states its outcome. "confirmed" and "refused" come from the
+// gate itself. "unknown" means the gate may have committed the change but
+// its answer was lost: the connection closed or the gate did not answer in
+// time. The viewer then reconnects and shows the state the gate reports,
+// instead of saying that control did not change.
 
 export const webVNCInputGateCapability = "input_gate";
 
@@ -28,8 +34,15 @@ const refusalMessages: Record<string, string> = {
   take_failed: "Control could not be taken safely. Nobody has control.",
   release_failed: "Your input could not be released safely. Nobody has control.",
   busy: "A change of control is already in progress.",
-  bridge_disconnected: "The desktop connection closed before control changed.",
-  timeout: "The desktop did not confirm the change of control in time.",
+  bridge_disconnected:
+    "The desktop connection closed before the request was sent. Control did not change.",
+};
+
+// The answer to a request the gate received was lost; control may have changed.
+const unknownMessages: Record<string, string> = {
+  bridge_disconnected:
+    "The desktop connection closed while control was changing. Reconnecting to check who has control.",
+  timeout: "The desktop did not answer in time. Checking who has control.",
 };
 
 export type WebVNCInputAction = "take" | "return";
@@ -65,17 +78,17 @@ export function webVNCInputRequestRefusal(
 
 export interface WebVNCInputView {
   gate: boolean;
+  /** Absent until the gate has reported its state on this connection. */
   owner?: "agent" | "human" | "none";
   holder?: "self" | "other" | "none";
 }
 
-export interface WebVNCInputResult {
-  ok: boolean;
-  owner: "agent" | "human" | "none";
-  holder: "self" | "other" | "none";
-  code?: string;
-  message?: string;
-}
+type InputState = { owner: "agent" | "human" | "none"; holder: "self" | "other" | "none" };
+
+export type WebVNCInputResult =
+  | ({ ok: true; outcome: "confirmed" } & InputState)
+  | ({ ok: false; outcome: "refused"; code: string; message: string } & Partial<InputState>)
+  | { ok: false; outcome: "unknown"; code: string; message: string };
 
 interface Pending {
   key: string;
@@ -114,17 +127,12 @@ function parseGateMessage(message: unknown): Record<string, unknown> | undefined
   }
 }
 
-function stateOf(
-  record: Record<string, unknown>,
-): Pick<WebVNCInputResult, "owner" | "holder"> | undefined {
+function stateOf(record: Record<string, unknown>): InputState | undefined {
   const owner = record["owner"];
   const holder = record["holder"];
   if (typeof owner !== "string" || !owners.has(owner)) return undefined;
   if (typeof holder !== "string" || !holders.has(holder)) return undefined;
-  return {
-    owner: owner as WebVNCInputResult["owner"],
-    holder: holder as WebVNCInputResult["holder"],
-  };
+  return { owner: owner as InputState["owner"], holder: holder as InputState["holder"] };
 }
 
 function inputKey(leaseID: string, agentID: string): string {
@@ -133,7 +141,7 @@ function inputKey(leaseID: string, agentID: string): string {
 
 /** Tracks each gate connection's reported state and in-flight requests. */
 export class WebVNCInputTracker {
-  private readonly states = new Map<string, Pick<WebVNCInputResult, "owner" | "holder">>();
+  private readonly states = new Map<string, InputState>();
   private readonly pending = new Map<string, Pending>();
 
   /** Handles a bridge's input_state or input_result message; false for anything else. */
@@ -155,9 +163,10 @@ export class WebVNCInputTracker {
       const code = typeof record["code"] === "string" ? record["code"] : "take_failed";
       pending.resolve(
         record["ok"] === true && state
-          ? { ok: true, ...state }
+          ? { ok: true, outcome: "confirmed", ...state }
           : {
               ok: false,
+              outcome: "refused",
               ...(state ?? { owner: "none", holder: "none" }),
               code: code in refusalMessages ? code : "refused",
               message: refusalMessages[code] ?? "Control did not change.",
@@ -169,10 +178,7 @@ export class WebVNCInputTracker {
 
   view(leaseID: string, agentID: string | undefined, gate: boolean): WebVNCInputView {
     if (!gate || !agentID) return { gate: false };
-    return {
-      gate: true,
-      ...(this.states.get(inputKey(leaseID, agentID)) ?? { owner: "none", holder: "none" }),
-    };
+    return { gate: true, ...this.states.get(inputKey(leaseID, agentID)) };
   }
 
   /** Sends a take or return request down one gate connection and waits for its answer. */
@@ -189,20 +195,30 @@ export class WebVNCInputTracker {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        resolve(this.failure(key, "timeout"));
+        resolve(unknown("timeout"));
       }, requestTimeoutMs);
       this.pending.set(id, { key, resolve, timer });
       try {
         socket.send(JSON.stringify({ type: "input_request", id, action }));
       } catch {
+        // Never sent, so control certainly did not change.
         this.pending.delete(id);
         clearTimeout(timer);
-        resolve(this.failure(key, "bridge_disconnected"));
+        resolve({
+          ok: false,
+          outcome: "refused",
+          ...this.states.get(key),
+          code: "bridge_disconnected",
+          message: refusalMessages["bridge_disconnected"]!,
+        });
       }
     });
   }
 
-  /** Forgets a closed gate connection and fails its in-flight requests. */
+  /**
+   * Forgets a closed gate connection. Its in-flight requests reached the
+   * gate, which may have committed them, so their outcome is unknown.
+   */
   forget(leaseID: string, agentID: string): void {
     const key = inputKey(leaseID, agentID);
     this.states.delete(key);
@@ -210,16 +226,11 @@ export class WebVNCInputTracker {
       if (pending.key !== key) continue;
       this.pending.delete(id);
       clearTimeout(pending.timer);
-      pending.resolve(this.failure(key, "bridge_disconnected"));
+      pending.resolve(unknown("bridge_disconnected"));
     }
   }
+}
 
-  private failure(key: string, code: string): WebVNCInputResult {
-    return {
-      ok: false,
-      ...(this.states.get(key) ?? { owner: "none", holder: "none" }),
-      code,
-      message: refusalMessages[code] ?? "Control did not change.",
-    };
-  }
+function unknown(code: string): WebVNCInputResult {
+  return { ok: false, outcome: "unknown", code, message: unknownMessages[code]! };
 }

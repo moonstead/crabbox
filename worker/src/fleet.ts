@@ -12014,10 +12014,19 @@ export class FleetCoordinator {
     );
     this.recordWebVNCEvent(
       lease.id,
-      result.ok ? (action === "take" ? "input_taken" : "input_returned") : "input_refused",
+      result.outcome === "confirmed"
+        ? action === "take"
+          ? "input_taken"
+          : "input_returned"
+        : result.outcome === "unknown"
+          ? "input_unknown"
+          : "input_refused",
       viewer.label,
     );
-    return json({ leaseID: lease.id, viewerID, ...result }, { status: result.ok ? 200 : 409 });
+    // 202: the gate got the request but its answer was lost, so control may
+    // or may not have changed. The viewer reconnects and shows the gate's state.
+    const status = { confirmed: 200, unknown: 202, refused: 409 }[result.outcome];
+    return json({ leaseID: lease.id, viewerID, ...result }, { status });
   }
 
   private async webVNCTakeControl(request: Request, identifier: string): Promise<Response> {

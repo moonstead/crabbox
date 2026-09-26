@@ -31,11 +31,8 @@ describe("WebVNCInputTracker", () => {
   it("tracks each gate connection's state", () => {
     const tracker = new WebVNCInputTracker();
     expect(tracker.view(leaseID, "agent_1", false)).toEqual({ gate: false });
-    expect(tracker.view(leaseID, "agent_1", true)).toEqual({
-      gate: true,
-      owner: "none",
-      holder: "none",
-    });
+    // Until the gate reports, nobody knows who has control; the view says so.
+    expect(tracker.view(leaseID, "agent_1", true)).toEqual({ gate: true });
     expect(
       tracker.receive(
         leaseID,
@@ -56,7 +53,7 @@ describe("WebVNCInputTracker", () => {
     expect(tracker.receive(leaseID, "agent_1", "RFB 003.008\n")).toBe(false);
     expect(tracker.receive(leaseID, "agent_1", new ArrayBuffer(4))).toBe(false);
     tracker.forget(leaseID, "agent_1");
-    expect(tracker.view(leaseID, "agent_1", true).owner).toBe("none");
+    expect(tracker.view(leaseID, "agent_1", true)).toEqual({ gate: true });
   });
 
   it("answers a request from the same gate connection only, with coordinator text", async () => {
@@ -93,6 +90,7 @@ describe("WebVNCInputTracker", () => {
     );
     await expect(pending).resolves.toEqual({
       ok: false,
+      outcome: "refused",
       owner: "human",
       holder: "other",
       code: "held_by_other",
@@ -100,20 +98,54 @@ describe("WebVNCInputTracker", () => {
     });
   });
 
-  it("fails closed when the connection closes or never answers", async () => {
+  it("reports a lost answer as unknown, never as a failure", async () => {
     vi.useFakeTimers();
     try {
       const tracker = new WebVNCInputTracker();
       const socket = { send() {} } as unknown as WebSocket;
+      tracker.receive(
+        leaseID,
+        "agent_1",
+        JSON.stringify({ type: "input_state", owner: "human", holder: "self" }),
+      );
+      // The gate may commit a return and lose the connection before answering.
       const closed = tracker.request(leaseID, "agent_1", socket, "return");
       tracker.forget(leaseID, "agent_1");
-      await expect(closed).resolves.toMatchObject({ ok: false, code: "bridge_disconnected" });
+      const lost = await closed;
+      expect(lost).toEqual({
+        ok: false,
+        outcome: "unknown",
+        code: "bridge_disconnected",
+        message:
+          "The desktop connection closed while control was changing. Reconnecting to check who has control.",
+      });
+      // No stale owner is reported with it.
+      expect(lost).not.toHaveProperty("owner");
       const silent = tracker.request(leaseID, "agent_1", socket, "take");
       vi.advanceTimersByTime(45_000);
-      await expect(silent).resolves.toMatchObject({ ok: false, code: "timeout" });
+      await expect(silent).resolves.toMatchObject({
+        ok: false,
+        outcome: "unknown",
+        code: "timeout",
+      });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("reports a request that was never sent as refused", async () => {
+    const tracker = new WebVNCInputTracker();
+    const socket = {
+      send() {
+        throw new Error("closed");
+      },
+    } as unknown as WebSocket;
+    await expect(tracker.request(leaseID, "agent_1", socket, "take")).resolves.toMatchObject({
+      ok: false,
+      outcome: "refused",
+      code: "bridge_disconnected",
+      message: "The desktop connection closed before the request was sent. Control did not change.",
+    });
   });
 });
 
@@ -233,6 +265,7 @@ describe("POST /portal/leases/{lease}/vnc/input", () => {
     expect(result.status).toBe(200);
     await expect(result.json()).resolves.toMatchObject({
       ok: true,
+      outcome: "confirmed",
       owner: "human",
       holder: "self",
     });
@@ -240,6 +273,21 @@ describe("POST /portal/leases/{lease}/vnc/input", () => {
       gate: true,
       owner: "human",
       holder: "self",
+    });
+  });
+
+  it("answers 202 with an unknown outcome when the gate connection closes mid-change", async () => {
+    const { fleet, sent, change } = harness(["input_gate"]);
+    const response = change("viewer_person", "return", "webvnc_session_person");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sent).toHaveLength(1);
+    fleet.webVNCInput.forget(leaseID, "agent_person");
+    const result = await response;
+    expect(result.status).toBe(202);
+    await expect(result.json()).resolves.toMatchObject({
+      ok: false,
+      outcome: "unknown",
+      code: "bridge_disconnected",
     });
   });
 
@@ -357,6 +405,10 @@ describe("WebVNC viewer page", () => {
     // Take and return switch desktops; the page reconnects instead of failing.
     expect(body).toContain("inputSwitchPending = true;");
     expect(body).toContain('setStatus("switching desktops");');
+    // An unknown outcome is checked on a new connection, not shown as failed.
+    expect(body).toContain('if (result.outcome === "unknown") {');
+    expect(body).toContain('setStatus("checking who has control", "warn");');
+    expect(body).toContain("takeoverBtn && inputGate && !inputGate.owner");
   });
 
   it("uses the embed viewer's own input route", async () => {

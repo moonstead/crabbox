@@ -202,7 +202,17 @@ connected:
 - The gate decides and answers with `input_result`, and reports changes with
   `input_state`. `GET .../vnc/status` returns them as
   `input: {gate, owner, holder}`, where `owner` is `agent`, `human` or `none`
-  and `holder` is `self`, `other` or `none` for the viewer asking.
+  and `holder` is `self`, `other` or `none` for the viewer asking. Until the
+  gate has reported on a connection, `input` has no `owner`.
+- Every answer to take or return has an `outcome`:
+  - `confirmed` (HTTP 200): the gate made the change
+  - `refused` (HTTP 409): the gate refused it, or the request was never sent,
+    so control did not change
+  - `unknown` (HTTP 202): the gate received the request but its answer was
+    lost, because the bridge connection closed or the gate did not answer
+    within 45 seconds. The gate may have made the change. The viewer page
+    reconnects and shows the state the gate then reports, and never says
+    that control did not change.
 - The coordinator drops every `input_*` message a viewer sends, and the
   bridge forwards only the coordinator's `input_binding` and `input_request`
   as control frames. A viewer therefore cannot forge a binding or speak for

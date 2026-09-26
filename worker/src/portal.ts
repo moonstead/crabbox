@@ -1608,7 +1608,13 @@ export function portalVNC(
         isController = controlling;
         applySizing();
         if (controlling) window.setTimeout(focusVNC, 0);
-        if (takeoverBtn && inputGate) {
+        if (takeoverBtn && inputGate && !inputGate.owner) {
+          // The gate has not reported its state on this connection yet.
+          takeoverBtn.hidden = !connectedViewer;
+          takeoverBtn.disabled = true;
+          takeoverBtn.title = "Checking who has the desktop's input";
+          if (previousInput?.owner) setStatus("checking who has control", "warn");
+        } else if (takeoverBtn && inputGate) {
           const heldByOther = inputGate.owner === "human" && inputGate.holder === "other";
           takeoverBtn.hidden = !connectedViewer;
           takeoverBtn.disabled = controlPending || heldByOther || !connectedViewer;
@@ -1724,6 +1730,16 @@ export function portalVNC(
             return { response, result };
           }, inputTimeoutMs);
           if (!connected || epoch !== connectionEpoch) return;
+          if (result.outcome === "unknown") {
+            // The desktop may have changed control; it has not said. Ask it
+            // again on a new connection rather than report a failure.
+            setStatus("checking who has control", "warn");
+            inputSwitchPending = false;
+            retireConnection();
+            window.clearTimeout(retryTimer);
+            retryTimer = window.setTimeout(connect, 500);
+            return;
+          }
           if (!response.ok) {
             inputSwitchPending = false;
             throw new Error(result.message || "control did not change");
