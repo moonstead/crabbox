@@ -51,10 +51,25 @@ type adapterChildState struct {
 	Deleted    []string              `json:"deleted"`
 	Commands   []string              `json:"commands"`
 	Failed     *adapterFailedAttempt `json:"failed,omitempty"`
-	// CloneFailure is "rejected" for a definite 403 from the clone endpoint or
-	// "uncertain" for a failure after the clone was submitted.
+	// CloneFailure is "rejected" for a definite 403 from the clone endpoint,
+	// "uncertain" for a failure after the clone was submitted, or "unreachable"
+	// when warmup cannot read the Proxmox inventory before its claim exists.
 	CloneFailure string   `json:"cloneFailure,omitempty"`
 	Errors       []string `json:"errors,omitempty"`
+	// After ListErrorsAfter successful inventory reads, list fails until
+	// ListErrorsUntil.
+	ListErrorsAfter int                   `json:"listErrorsAfter,omitempty"`
+	ListErrorsUntil time.Time             `json:"listErrorsUntil,omitzero"`
+	Outcomes        []adapterChildOutcome `json:"outcomes,omitempty"`
+}
+
+type adapterChildOutcome struct {
+	Command string    `json:"command"`
+	Cleanup bool      `json:"cleanup,omitempty"`
+	Failed  bool      `json:"failed,omitempty"`
+	At      time.Time `json:"at"`
+	// Clients counts Proxmox API clients the child created.
+	Clients int `json:"clients,omitempty"`
 }
 
 func (vm adapterChildVM) server() core.Server {
@@ -68,7 +83,10 @@ func adapterChildVMFromServer(server core.Server) adapterChildVM {
 }
 
 // The fake clone replaces the inventory; keep other leases' VMs beside it.
-type adapterChildClient struct{ *fixedProxmoxClient }
+type adapterChildClient struct {
+	*fixedProxmoxClient
+	inventoryErr error
+}
 
 func (c *adapterChildClient) CreateServerWithVMID(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, vmid int, labels map[string]string, bind func(core.Server) error) (core.Server, error) {
 	others := slices.Clone(c.servers)
@@ -86,6 +104,9 @@ func (c *adapterChildClient) CreateServerWithVMID(ctx context.Context, cfg core.
 
 // Like the real client, an empty pool lists as [] rather than null.
 func (c *adapterChildClient) ListCrabboxServersCluster(ctx context.Context) ([]core.Server, error) {
+	if c.inventoryErr != nil {
+		return nil, c.inventoryErr
+	}
 	servers, err := c.fixedProxmoxClient.ListCrabboxServersCluster(ctx)
 	if servers == nil && err == nil {
 		servers = []core.Server{}
@@ -124,7 +145,7 @@ func runAdapterChild(path string, args []string) int {
 		return 70
 	}
 	state.Commands = append(state.Commands, args[0])
-	client := &adapterChildClient{&fixedProxmoxClient{fakeProxmoxDoctorClient: &fakeProxmoxDoctorClient{}, nextVMID: 417, fixedCreates: state.Clones}}
+	client := &adapterChildClient{fixedProxmoxClient: &fixedProxmoxClient{fakeProxmoxDoctorClient: &fakeProxmoxDoctorClient{}, nextVMID: 417, fixedCreates: state.Clones}}
 	for _, vm := range state.VMs {
 		client.servers = append(client.servers, vm.server())
 	}
@@ -134,8 +155,27 @@ func runAdapterChild(path string, args []string) int {
 			Body: "Permission check failed (/sdn/zones/localnetwork/vmbr0, SDN.Use)"}
 	case "uncertain":
 		client.fixedCreateErr = errors.New("clone task status: http 403: Permission check failed")
+	case "unreachable":
+		if args[0] == "warmup" {
+			client.inventoryErr = errors.New("proxmox GET /cluster/resources: dial tcp 192.0.2.1:8006: connect: connection refused")
+		}
 	}
-	newClient = func(core.Config) (proxmoxClient, error) { return client, nil }
+	outcome := adapterChildOutcome{Command: args[0], Cleanup: slices.Contains(args, "--confirmed-absent-local-cleanup=true"), At: time.Now()}
+	if args[0] == "list" && outcome.At.Before(state.ListErrorsUntil) {
+		successes := 0
+		for _, previous := range state.Outcomes {
+			if previous.Command == "list" && !previous.Failed {
+				successes++
+			}
+		}
+		if successes >= state.ListErrorsAfter {
+			client.inventoryErr = errors.New("proxmox GET /cluster/resources: http 596: Connection timed out")
+		}
+	}
+	newClient = func(core.Config) (proxmoxClient, error) {
+		outcome.Clients++
+		return client, nil
+	}
 	bootstraps := state.Bootstraps
 	waitForSSHReadyFunc = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
 		state.Bootstraps++
@@ -163,6 +203,8 @@ func runAdapterChild(path string, args []string) int {
 		}
 		state.Failed = failed
 	}
+	outcome.Failed = runErr != nil
+	state.Outcomes = append(state.Outcomes, outcome)
 	state.Clones = client.fixedCreates
 	state.Deleted = append(state.Deleted, client.deletedIDs...)
 	state.VMs = state.VMs[:0]
