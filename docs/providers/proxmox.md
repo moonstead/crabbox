@@ -4,6 +4,7 @@ Read this when you:
 
 - choose `provider: proxmox`;
 - set up a Proxmox VE VM template for Crabbox;
+- run headless leases as unprivileged LXC containers;
 - debug Proxmox API tokens, clone tasks, guest-agent IP discovery, or cleanup;
 - change `internal/providers/proxmox` or `internal/cli/proxmox.go`.
 
@@ -11,7 +12,9 @@ Proxmox is a direct SSH-lease provider for Linux QEMU VMs on a self-hosted
 Proxmox VE cluster. For each lease Crabbox clones a configured QEMU template,
 injects a per-lease SSH key through cloud-init, uses the QEMU guest agent to
 discover the VM's IPv4 address, runs the Crabbox Linux bootstrap over SSH, and
-then drives the normal SSH sync/run/release path.
+then drives the normal SSH sync/run/release path. With `guest: lxc` it instead
+creates a headless, unprivileged LXC container from an immutable `vztmpl`
+archive; see [Unprivileged LXC containers](#unprivileged-lxc-containers).
 
 The provider is direct-only: it talks to the Proxmox API straight from the CLI.
 The Crabbox coordinator (broker) does not provision or broker Proxmox capacity,
@@ -221,6 +224,12 @@ CRABBOX_PROXMOX_FULL_CLONE
 CRABBOX_PROXMOX_INSECURE_TLS
 CRABBOX_PROXMOX_TEMPLATE_DESKTOP
 CRABBOX_PROXMOX_TEMPLATE_BROWSER
+CRABBOX_PROXMOX_GUEST
+CRABBOX_PROXMOX_LXC_TEMPLATE
+CRABBOX_PROXMOX_LXC_CORES
+CRABBOX_PROXMOX_LXC_MEMORY_MIB
+CRABBOX_PROXMOX_LXC_SWAP_MIB
+CRABBOX_PROXMOX_LXC_DISK_GIB
 ```
 
 Provider flags mirror the non-secret config fields:
@@ -236,6 +245,12 @@ Provider flags mirror the non-secret config fields:
 --proxmox-work-root
 --proxmox-full-clone
 --proxmox-insecure-tls
+--proxmox-guest
+--proxmox-lxc-template
+--proxmox-lxc-cores
+--proxmox-lxc-memory-mib
+--proxmox-lxc-swap-mib
+--proxmox-lxc-disk-gib
 ```
 
 There is intentionally no `--proxmox-token-secret` flag, so the token secret
@@ -304,6 +319,79 @@ The requested capabilities are stored in the VM description and are part of a
 fixed lease's create intent. Replaying a fixed lease ID with different
 capabilities returns `lease_id_conflict` without cloning another VM.
 
+## Unprivileged LXC containers
+
+Set `guest: lxc` to lease headless Linux containers instead of QEMU VMs. Use it
+for ordinary headless work. Keep QEMU for desktops, browsers, code-server,
+device passthrough, and any workload that needs its own kernel or must be
+isolated as hostile code.
+
+```yaml
+provider: proxmox
+target: linux
+proxmox:
+  apiUrl: https://pve.example.com:8006
+  tokenId: crabbox@pve!ci
+  node: pve1
+  guest: lxc
+  lxcTemplate: local:vztmpl/ubuntu-24.04-headless-20260926.tar.zst
+  lxcCores: 2
+  lxcMemoryMiB: 4096
+  lxcSwapMiB: 512
+  lxcDiskGiB: 16
+  storage: local-lvm
+  pool: crabbox-lxc
+  bridge: vmbr0
+  user: crabbox
+  workRoot: /work/crabbox
+```
+
+`lxcTemplate`, `lxcCores`, `lxcMemoryMiB`, `lxcDiskGiB`, `storage` and `bridge`
+are required. `lxcSwapMiB` defaults to 0. `templateId`, `templateDesktop` and
+`templateBrowser` must be unset, `fullClone` does not apply, and `user` must
+not be `root`. `--desktop`, `--browser` and `--code` fail before any Proxmox
+API call. The LXC settings are refused unless `guest` is `lxc`.
+
+For each lease, Crabbox:
+
+1. Creates the container with `POST /nodes/<node>/lxc`: the configured
+   `vztmpl` volume, `unprivileged=1`, exactly the configured cores, memory,
+   swap and root disk on `storage`, one DHCP `eth0` on `bridge`, `onboot=0`,
+   the pool, and the per-lease SSH public key. The request names no feature
+   flag, mount point, device, hookscript or raw LXC key.
+2. Reads the configuration back and refuses the container if any other key is
+   present, it is not unprivileged, or a resource, disk or network value
+   differs. A refused container is deleted, or kept in fixed custody for
+   checked release.
+3. Starts it and reads eth0's IPv4 address from
+   `/nodes/<node>/lxc/<vmid>/interfaces`. There is no guest agent.
+4. Connects once as `root`, because Proxmox installs a create-time key only
+   for root. That session checks the template's tools and lease user, moves
+   the key to the lease user, writes `PermitRootLogin no`, removes root's key
+   and restarts SSH. It installs nothing. Every later session uses the lease
+   user.
+
+Proxmox gives each created container fresh SSH host keys and an empty machine
+ID. Only `root@pam` can create privileged containers, set feature flags other
+than nesting, add bind mounts or devices, or set hookscripts, and Crabbox never
+asks for nesting. The container therefore keeps Proxmox's default unprivileged
+user namespace, AppArmor profile and seccomp filter.
+
+LXC has no `vmgenid`. Each container instead gets a random 128-bit
+`lxc_generation` label at creation. A fixed lease binds that value exactly as
+it binds `vmgenid` for QEMU, before the configuration audit, so a refused
+container stays in custody for checked release. Release stops and deletes the
+container with `purge=1` and `destroy-unreferenced-disks=1`, then proves
+absence the same way. Prepared-claim recovery fences on active `vzcreate`
+tasks instead of `qmclone`.
+
+The template must be an unprivileged-compatible root filesystem with
+`openssh-server`, `sudo`, `git`, `rsync`, `curl` and `jq`, SSH enabled as
+`ssh.service`, and a non-root lease user with a home under `/home` and
+passwordless `sudo`. Keep credentials, host keys and a machine ID out of it.
+Treat the archive as immutable: give every build a new file name and never
+overwrite one that a configuration names.
+
 ## Readiness and token permissions
 
 `crabbox doctor --provider proxmox` is the readiness gate for this provider. In
@@ -321,6 +409,10 @@ node       /nodes/<node>/status is readable
 storage    clone target and all template source stores are image-capable
 bridge     configured bridge or the template net0 bridge is active
 template   /nodes/<node>/qemu and /config show templateId is a QEMU template
+           (guest=lxc: the lxcTemplate volume is listed as vztmpl content)
+lxc_permissions
+           guest=lxc only: the pool or /vms, root-disk storage and template
+           storage grant every privilege the container lifecycle needs
 nextid     /cluster/nextid is readable
 pool       configured /pools/<pool> is readable, when set
 inventory  /vms has propagated VM.Audit and cluster inventory is readable
@@ -346,6 +438,13 @@ for lease lifecycle operations:
 /sdn                     SDN.Audit when the configured bridge is SDN-managed
 /pool/<pool>              Pool.Audit when a pool is configured
 ```
+
+A `guest: lxc` lease needs, on its pool or on `/vms` without a pool,
+`VM.Allocate`, `VM.Audit`, `VM.Config.CPU`, `VM.Config.Disk`,
+`VM.Config.Memory`, `VM.Config.Network`, `VM.Config.Options` and
+`VM.PowerMgmt`. It also needs `Datastore.AllocateSpace` on the root-disk
+storage, `Datastore.Audit` or `Datastore.AllocateSpace` on the template's
+storage, and `SDN.Use` on the bridge. It needs no template VM grant.
 
 The exact least-privilege role depends on the Proxmox VE version and local ACL
 model. If doctor fails with `class=permission`, fix the named endpoint first and
@@ -529,12 +628,14 @@ VMs through raw Proxmox operations while cleanup runs.
 `crabbox adapter serve --provider proxmox` uses the same direct provider and
 fixed lease IDs. At startup the adapter reads the provider's controller identity
 and refuses to listen unless the configuration is complete: API URL, node,
-token ID, token secret, a positive `templateId` and `target=linux`.
+token ID, token secret, a positive `templateId` (or a valid `guest: lxc`
+profile) and `target=linux`.
 
 The identity includes an opaque, non-secret scope. It is a SHA-256 digest of the
 normalized API endpoint, node, token ID, template, storage, pool, bridge, clone
-mode, guest user and work root. The token secret must be present, but it is
-never part of the scope.
+mode, guest user and work root. For `guest: lxc` it also covers the `vztmpl`
+volume and the four resource bounds. QEMU scopes are unchanged by LXC support.
+The token secret must be present, but it is never part of the scope.
 The adapter stores the scope with each workspace before its first lifecycle
 operation. Later `inspect`, `list`, `stop` and WebVNC subprocesses for that
 workspace refuse to run when the current configuration produces another scope.

@@ -21,6 +21,12 @@ type fileProxmoxConfig struct {
 	InsecureTLS     *bool  `yaml:"insecureTLS,omitempty"`
 	TemplateDesktop *bool  `yaml:"templateDesktop,omitempty"`
 	TemplateBrowser *bool  `yaml:"templateBrowser,omitempty"`
+	Guest           string `yaml:"guest,omitempty"`
+	LXCTemplate     string `yaml:"lxcTemplate,omitempty"`
+	LXCCores        int    `yaml:"lxcCores,omitempty"`
+	LXCMemoryMiB    int    `yaml:"lxcMemoryMiB,omitempty"`
+	LXCSwapMiB      int    `yaml:"lxcSwapMiB,omitempty"`
+	LXCDiskGiB      int    `yaml:"lxcDiskGiB,omitempty"`
 }
 
 const ProxmoxConfigDefaultUser string = "crabbox"
@@ -52,22 +58,28 @@ func (cfg *ProxmoxConfig) applyFile(file *fileProxmoxConfig) (ProxmoxConfigAppli
 
 func (cfg *ProxmoxConfig) applyEnv() (ProxmoxConfigApplied, error) {
 	var applied ProxmoxConfigApplied
-	err := applyConfigEnvironment(cfg, &applied, 0, 14)
+	err := applyConfigEnvironment(cfg, &applied, 0, 20)
 	return applied, err
 }
 
 // ProxmoxConfigFlagValues holds parsed values; only visited flags are applied.
 type ProxmoxConfigFlagValues struct {
-	APIURL      *string
-	Node        *string
-	TemplateID  *int
-	Storage     *string
-	Pool        *string
-	Bridge      *string
-	User        *string
-	WorkRoot    *string
-	FullClone   *bool
-	InsecureTLS *bool
+	APIURL       *string
+	Node         *string
+	TemplateID   *int
+	Storage      *string
+	Pool         *string
+	Bridge       *string
+	User         *string
+	WorkRoot     *string
+	FullClone    *bool
+	InsecureTLS  *bool
+	Guest        *string
+	LXCTemplate  *string
+	LXCCores     *int
+	LXCMemoryMiB *int
+	LXCSwapMiB   *int
+	LXCDiskGiB   *int
 }
 
 // RegisterProxmoxConfigFlags registers mechanical bindings without selecting a provider.

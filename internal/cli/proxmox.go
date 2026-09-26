@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"path"
 	"regexp"
 	"sort"
@@ -27,7 +26,9 @@ type ProxmoxClient struct {
 	TokenID     string
 	TokenSecret string
 	Node        string
-	Client      *http.Client
+	// Guest is qemu or lxc. Lifecycle, inventory and identity use this type only.
+	Guest  string
+	Client *http.Client
 }
 
 type ProxmoxReadinessCheck struct {
@@ -97,11 +98,16 @@ func NewProxmoxClient(cfg Config) (*ProxmoxClient, error) {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // User opt-in for self-signed private Proxmox clusters.
 		client.Transport = transport
 	}
+	guest := ProxmoxGuest(cfg)
+	if guest != ProxmoxGuestQEMU && guest != ProxmoxGuestLXC {
+		return nil, Exit(2, "proxmox guest must be qemu or lxc")
+	}
 	return &ProxmoxClient{
 		BaseURL:     apiURL,
 		TokenID:     cfg.Proxmox.TokenID,
 		TokenSecret: cfg.Proxmox.TokenSecret,
 		Node:        cfg.Proxmox.Node,
+		Guest:       guest,
 		Client:      client,
 	}, nil
 }
@@ -213,9 +219,13 @@ func (c *ProxmoxClient) DoctorReadiness(ctx context.Context, cfg Config) ([]Prox
 		c.proxmoxNodeCheck(ctx, cfg),
 		c.proxmoxStorageCheck(ctx, cfg),
 		c.proxmoxNetworkCheck(ctx, cfg),
-		c.proxmoxTemplateCheck(ctx, cfg),
-		c.proxmoxNextIDCheck(ctx),
 	}
+	if c.guestType() == ProxmoxGuestLXC {
+		checks = append(checks, c.proxmoxLXCTemplateCheck(ctx, cfg), c.proxmoxLXCPermissionCheck(ctx, cfg))
+	} else {
+		checks = append(checks, c.proxmoxTemplateCheck(ctx, cfg))
+	}
+	checks = append(checks, c.proxmoxNextIDCheck(ctx))
 	if cfg.Proxmox.Pool != "" {
 		checks = append(checks, c.proxmoxPoolCheck(ctx, cfg))
 	}
@@ -259,6 +269,9 @@ func (c *ProxmoxClient) proxmoxStorageCheck(ctx context.Context, cfg Config) Pro
 	var storages []proxmoxStorage
 	if err := c.doRequired(ctx, http.MethodGet, path, nil, &storages); err != nil {
 		return c.proxmoxFailedReadiness("storage", path, err, map[string]string{"storage": cfg.Proxmox.Storage})
+	}
+	if c.guestType() == ProxmoxGuestLXC {
+		return proxmoxLXCStorageCheck(cfg, storages, "/nodes/"+cfg.Proxmox.Node+"/storage")
 	}
 	var destination *ProxmoxReadinessCheck
 	if cfg.Proxmox.Storage == "" {
@@ -473,7 +486,7 @@ func (c *ProxmoxClient) proxmoxNetworkCheck(ctx context.Context, cfg Config) Pro
 	source := "config"
 	if bridges[0] == "" {
 		source = "template"
-		if cfg.Proxmox.TemplateID <= 0 {
+		if cfg.Proxmox.TemplateID <= 0 || c.guestType() == ProxmoxGuestLXC {
 			return ProxmoxReadinessCheck{
 				Status:  "failed",
 				Check:   "bridge",
@@ -590,12 +603,12 @@ func (c *ProxmoxClient) proxmoxTemplateCheck(ctx context.Context, cfg Config) Pr
 			Details: map[string]string{"templateId": "missing", "class": "config", "hint": "set_proxmox_template_id"},
 		}
 	}
-	vms, err := c.listQEMU(ctx)
+	vms, err := c.listGuests(ctx)
 	if err != nil {
 		return c.proxmoxFailedReadiness("template", "/nodes/"+url.PathEscape(c.Node)+"/qemu", err, map[string]string{"templateId": strconv.Itoa(cfg.Proxmox.TemplateID)})
 	}
 	for _, vm := range vms {
-		if vm.VMID != cfg.Proxmox.TemplateID {
+		if int(vm.VMID) != cfg.Proxmox.TemplateID {
 			continue
 		}
 		if vm.Template == 0 {
@@ -691,7 +704,7 @@ func (c *ProxmoxClient) proxmoxInventoryCheck(ctx context.Context) ProxmoxReadin
 	leases := 0
 	qemuVMs := 0
 	for _, vm := range vms {
-		if vm.Type != "qemu" {
+		if vm.Type != c.guestType() {
 			continue
 		}
 		qemuVMs++
@@ -847,10 +860,10 @@ func (c *ProxmoxClient) NextVMID(ctx context.Context) (int, error) {
 }
 
 type proxmoxVM struct {
-	VMID     int    `json:"vmid"`
-	Name     string `json:"name"`
-	Status   string `json:"status"`
-	Template int    `json:"template"`
+	VMID     proxmoxInt `json:"vmid"`
+	Name     string     `json:"name"`
+	Status   string     `json:"status"`
+	Template proxmoxInt `json:"template"`
 }
 
 type proxmoxClusterVM struct {
@@ -883,16 +896,17 @@ func (c *ProxmoxClient) requirePropagatedVMAudit(ctx context.Context, path strin
 	return nil
 }
 
-func (c *ProxmoxClient) listQEMU(ctx context.Context) ([]proxmoxVM, error) {
+// listGuests lists this node's guests of the configured type.
+func (c *ProxmoxClient) listGuests(ctx context.Context) ([]proxmoxVM, error) {
 	var vms []proxmoxVM
-	if err := c.doRequired(ctx, http.MethodGet, "/nodes/"+url.PathEscape(c.Node)+"/qemu", nil, &vms); err != nil {
+	if err := c.doRequired(ctx, http.MethodGet, "/nodes/"+url.PathEscape(c.Node)+"/"+c.guestType(), nil, &vms); err != nil {
 		return nil, err
 	}
 	return vms, nil
 }
 
 func (c *ProxmoxClient) ListCrabboxServers(ctx context.Context) ([]Server, error) {
-	vms, err := c.listQEMU(ctx)
+	vms, err := c.listGuests(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -901,7 +915,7 @@ func (c *ProxmoxClient) ListCrabboxServers(ctx context.Context) ([]Server, error
 		if vm.Template != 0 || !strings.HasPrefix(vm.Name, "crabbox-") {
 			continue
 		}
-		server, err := c.GetServer(ctx, strconv.Itoa(vm.VMID))
+		server, err := c.GetServer(ctx, strconv.Itoa(int(vm.VMID)))
 		if err != nil {
 			if IsProxmoxNotFound(err) {
 				continue
@@ -925,7 +939,7 @@ func (c *ProxmoxClient) ListCrabboxServersCluster(ctx context.Context) ([]Server
 	}
 	servers := make([]Server, 0, len(vms))
 	for _, vm := range vms {
-		if vm.Type != "qemu" || vm.Template != 0 || !strings.HasPrefix(vm.Name, "crabbox-") || vm.Node == "" {
+		if vm.Type != c.guestType() || vm.Template != 0 || !strings.HasPrefix(vm.Name, "crabbox-") || vm.Node == "" {
 			continue
 		}
 		server, exists, err := c.getClusterServer(ctx, vm)
@@ -966,7 +980,7 @@ func (c *ProxmoxClient) getClusterServer(ctx context.Context, vm proxmoxClusterV
 		}
 		found := false
 		for _, candidate := range refreshed {
-			if candidate.Type == "qemu" && candidate.Template == 0 && candidate.VMID == vm.VMID {
+			if candidate.Type == c.guestType() && candidate.Template == 0 && candidate.VMID == vm.VMID {
 				vm = candidate
 				found = true
 				break
@@ -1013,7 +1027,7 @@ func (c *ProxmoxClient) VerifyNoActiveCloneTasks(ctx context.Context) error {
 		return fmt.Errorf("permission denied: Proxmox prepared-claim recovery requires Sys.Audit on %s to inspect all active clone tasks", path)
 	}
 	var tasks []json.RawMessage
-	if err := c.doRequired(ctx, http.MethodGet, "/nodes/"+url.PathEscape(c.Node)+"/tasks?source=active&typefilter=qmclone&limit=1", nil, &tasks); err != nil {
+	if err := c.doRequired(ctx, http.MethodGet, "/nodes/"+url.PathEscape(c.Node)+"/tasks?source=active&typefilter="+c.createTaskType()+"&limit=1", nil, &tasks); err != nil {
 		return err
 	}
 	if len(tasks) != 0 {
@@ -1046,7 +1060,7 @@ func (c *ProxmoxClient) CreateServer(ctx context.Context, cfg Config, publicKey,
 	if cfg.TargetOS != targetLinux {
 		return Server{}, Exit(2, "proxmox provider currently supports target=linux only")
 	}
-	if cfg.Proxmox.TemplateID <= 0 {
+	if cfg.Proxmox.TemplateID <= 0 && ProxmoxGuest(cfg) != ProxmoxGuestLXC {
 		return Server{}, Exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
 	}
 	vmid, err := c.nextID(ctx)
@@ -1060,11 +1074,14 @@ func (c *ProxmoxClient) CreateServerWithVMID(ctx context.Context, cfg Config, pu
 	if cfg.TargetOS != targetLinux {
 		return Server{}, Exit(2, "proxmox provider currently supports target=linux only")
 	}
-	if cfg.Proxmox.TemplateID <= 0 {
+	if cfg.Proxmox.TemplateID <= 0 && ProxmoxGuest(cfg) != ProxmoxGuestLXC {
 		return Server{}, Exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
 	}
 	if vmid <= 0 {
 		return Server{}, Exit(2, "proxmox VMID must be positive")
+	}
+	if ProxmoxGuest(cfg) == ProxmoxGuestLXC {
+		return c.createLXCServer(ctx, cfg, publicKey, leaseID, slug, keep, vmid, extraLabels, bind)
 	}
 	name := LeaseProviderName(leaseID, slug)
 	full := "1"
@@ -1193,6 +1210,9 @@ func (e *proxmoxBootstrapError) Error() string { return e.message }
 func (e *proxmoxBootstrapError) Unwrap() error { return e.cause }
 
 func (c *ProxmoxClient) bootstrapSSH(ctx context.Context, host string, cfg Config) error {
+	if c.guestType() == ProxmoxGuestLXC {
+		return c.bootstrapLXCSSH(ctx, host, cfg)
+	}
 	target := SSHTargetFromConfig(cfg, host)
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
@@ -1202,23 +1222,7 @@ func (c *ProxmoxClient) bootstrapSSH(ctx context.Context, host string, cfg Confi
 			if err == nil {
 				return nil
 			}
-			status := "unknown"
-			var native *exec.ExitError
-			if errors.As(err, &native) && native.ExitCode() >= 0 {
-				status = strconv.Itoa(native.ExitCode())
-			}
-			diagnostic, truncated := out.boundedString()
-			if truncated {
-				// A cut credential cannot be reliably redacted from a partial capture.
-				diagnostic = "diagnostics truncated; captured output omitted"
-			}
-			message := fmt.Sprintf("proxmox guest bootstrap exit=%s: %v", status, err)
-			if diagnostic = strings.TrimSpace(diagnostic); diagnostic != "" {
-				message += ": " + diagnostic
-			}
-			message = RedactDiagnosticSecrets(message, c.TokenID, c.TokenSecret, cfg.Proxmox.TokenID, cfg.Proxmox.TokenSecret)
-			message = proxmoxAPITokenPattern.ReplaceAllString(message, "PVEAPIToken=<redacted>")
-			return &proxmoxBootstrapError{message: message, cause: err}
+			return c.proxmoxBootstrapFailure(err, &out, cfg)
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout waiting for proxmox ssh bootstrap transport")
@@ -1239,7 +1243,7 @@ func proxmoxSSHKeysValue(publicKey string) string {
 
 func (c *ProxmoxClient) startVM(ctx context.Context, vmid int) error {
 	var upid string
-	if err := c.doRequired(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/qemu/%d/status/start", url.PathEscape(c.Node), vmid), url.Values{}, &upid); err != nil {
+	if err := c.doRequired(ctx, http.MethodPost, c.guestPath(vmid)+"/status/start", url.Values{}, &upid); err != nil {
 		return err
 	}
 	return c.waitTask(ctx, upid)
@@ -1247,7 +1251,7 @@ func (c *ProxmoxClient) startVM(ctx context.Context, vmid int) error {
 
 func (c *ProxmoxClient) stopVM(ctx context.Context, vmid int) error {
 	var upid string
-	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/qemu/%d/status/stop", url.PathEscape(c.Node), vmid), url.Values{}, &upid); err != nil {
+	if err := c.do(ctx, http.MethodPost, c.guestPath(vmid)+"/status/stop", url.Values{}, &upid); err != nil {
 		if IsProxmoxNotFound(err) {
 			return nil
 		}
@@ -1275,8 +1279,11 @@ func (c *ProxmoxClient) DeleteServer(ctx context.Context, id string) error {
 func (c *ProxmoxClient) purgeVM(ctx context.Context, vmid int) error {
 	q := url.Values{}
 	q.Set("purge", "1")
+	if c.guestType() == ProxmoxGuestLXC {
+		q.Set("destroy-unreferenced-disks", "1")
+	}
 	var upid string
-	if err := c.doRequired(ctx, http.MethodDelete, fmt.Sprintf("/nodes/%s/qemu/%d?%s", url.PathEscape(c.Node), vmid, q.Encode()), nil, &upid); err != nil {
+	if err := c.doRequired(ctx, http.MethodDelete, c.guestPath(vmid)+"?"+q.Encode(), nil, &upid); err != nil {
 		if IsProxmoxNotFound(err) {
 			return nil
 		}
@@ -1340,12 +1347,12 @@ func (c *ProxmoxClient) getServer(ctx context.Context, id string, requireConfig 
 		return c.getServerByName(ctx, id)
 	}
 	var status proxmoxVM
-	if err := c.doRequired(ctx, http.MethodGet, fmt.Sprintf("/nodes/%s/qemu/%d/status/current", url.PathEscape(c.Node), vmid), nil, &status); err != nil {
+	if err := c.doRequired(ctx, http.MethodGet, c.guestPath(vmid)+"/status/current", nil, &status); err != nil {
 		return Server{}, err
 	}
 	labels := map[string]string{}
 	var config map[string]any
-	configPath := fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(c.Node), vmid)
+	configPath := c.guestPath(vmid) + "/config"
 	var configErr error
 	if requireConfig {
 		configErr = c.doRequired(ctx, http.MethodGet, configPath, nil, &config)
@@ -1357,12 +1364,24 @@ func (c *ProxmoxClient) getServer(ctx context.Context, id string, requireConfig 
 			labels = proxmoxDescriptionLabels(desc)
 		}
 		if status.Name == "" {
-			if name, ok := config["name"].(string); ok {
-				status.Name = name
+			for _, key := range []string{"name", "hostname"} {
+				if name, ok := config[key].(string); ok && name != "" {
+					status.Name = name
+					break
+				}
 			}
 		}
 	} else if requireConfig {
 		return Server{}, configErr
+	}
+	if c.guestType() == ProxmoxGuestLXC {
+		ip, _ := c.lxcGuestIPv4(ctx, vmid)
+		server := proxmoxVMToServer(c.Node, status, labels, ip)
+		server.ImmutableID = proxmoxLXCGenerationID(labels[ProxmoxLXCGenerationLabel])
+		if server.Name == "" {
+			server.Name = "ct-" + strconv.Itoa(vmid)
+		}
+		return server, nil
 	}
 	ip, _ := c.guestIPv4(ctx, vmid)
 	server := proxmoxVMToServer(c.Node, status, labels, ip)
@@ -1399,16 +1418,16 @@ func proxmoxGenerationID(value string) string {
 }
 
 func (c *ProxmoxClient) getServerByName(ctx context.Context, name string) (Server, error) {
-	vms, err := c.listQEMU(ctx)
+	vms, err := c.listGuests(ctx)
 	if err != nil {
 		return Server{}, err
 	}
 	for _, vm := range vms {
 		if vm.Name == name {
-			return c.GetServer(ctx, strconv.Itoa(vm.VMID))
+			return c.GetServer(ctx, strconv.Itoa(int(vm.VMID)))
 		}
 	}
-	return Server{}, &ProxmoxError{Method: http.MethodGet, Path: "/nodes/" + c.Node + "/qemu/" + name, StatusCode: http.StatusNotFound, Body: "not found"}
+	return Server{}, &ProxmoxError{Method: http.MethodGet, Path: "/nodes/" + c.Node + "/" + c.guestType() + "/" + name, StatusCode: http.StatusNotFound, Body: "not found"}
 }
 
 func (c *ProxmoxClient) SetLabels(ctx context.Context, id string, labels map[string]string) error {
@@ -1430,8 +1449,14 @@ func (c *ProxmoxClient) SetLabelsOnNode(ctx context.Context, node, id string, la
 }
 
 func (c *ProxmoxClient) configureVM(ctx context.Context, vmid int, form url.Values) error {
+	// QEMU's asynchronous POST returns a task. Containers have only a
+	// synchronous PUT, which returns no data.
+	method := http.MethodPost
+	if c.guestType() == ProxmoxGuestLXC {
+		method = http.MethodPut
+	}
 	var upid string
-	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(c.Node), vmid), form, &upid); err != nil {
+	if err := c.do(ctx, method, c.guestPath(vmid)+"/config", form, &upid); err != nil {
 		return err
 	}
 	if upid == "" {
@@ -1517,7 +1542,7 @@ func proxmoxVMToServer(node string, vm proxmoxVM, labels map[string]string, ip s
 	}
 	server := Server{
 		Provider: "proxmox",
-		CloudID:  strconv.Itoa(vm.VMID),
+		CloudID:  strconv.Itoa(int(vm.VMID)),
 		HostID:   node,
 		ID:       int64(vm.VMID),
 		Name:     vm.Name,

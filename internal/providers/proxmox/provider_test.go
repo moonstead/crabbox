@@ -41,19 +41,21 @@ func TestProxmoxBindingFlags(t *testing.T) {
 					values := (Provider{}).RegisterFlags(fs, cfg)
 					count := 0
 					fs.VisitAll(func(*flag.Flag) { count++ })
-					if count != 10 || fs.Lookup("proxmox-token-id") != nil || fs.Lookup("proxmox-token-secret") != nil {
+					if count != 16 || fs.Lookup("proxmox-token-id") != nil || fs.Lookup("proxmox-token-secret") != nil {
 						t.Fatal("flag surface changed")
 					}
 					if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil || !reflect.DeepEqual(cfg, before) {
 						t.Fatal("unvisited flags changed configuration")
 					}
-					for _, name := range []string{"api-url", "node", "storage", "pool", "bridge", "user", "work-root"} {
+					for _, name := range []string{"api-url", "node", "storage", "pool", "bridge", "user", "work-root", "guest", "lxc-template"} {
 						if err := fs.Set("proxmox-"+name, raw); err != nil {
 							t.Fatal(err)
 						}
 					}
-					if err := fs.Set("proxmox-template-id", strconv.Itoa(id)); err != nil {
-						t.Fatal(err)
+					for _, name := range []string{"template-id", "lxc-cores", "lxc-memory-mib", "lxc-swap-mib", "lxc-disk-gib"} {
+						if err := fs.Set("proxmox-"+name, strconv.Itoa(id)); err != nil {
+							t.Fatal(err)
+						}
 					}
 					for _, name := range []string{"full-clone", "insecure-tls"} {
 						if err := fs.Set("proxmox-"+name, strconv.FormatBool(boolean)); err != nil {
@@ -64,7 +66,8 @@ func TestProxmoxBindingFlags(t *testing.T) {
 						t.Fatal("foreign values changed configuration")
 					}
 					want := before
-					want.Proxmox = core.ProxmoxConfig{APIURL: raw, Node: raw, TemplateID: id, Storage: raw, Pool: raw, Bridge: raw, User: raw, WorkRoot: raw, FullClone: boolean, InsecureTLS: boolean}
+					want.Proxmox = core.ProxmoxConfig{APIURL: raw, Node: raw, TemplateID: id, Storage: raw, Pool: raw, Bridge: raw, User: raw, WorkRoot: raw, FullClone: boolean, InsecureTLS: boolean,
+						Guest: raw, LXCTemplate: raw, LXCCores: id, LXCMemoryMiB: id, LXCSwapMiB: id, LXCDiskGiB: id}
 					want.ServerType = "template"
 					if id > 0 {
 						want.ServerType = "template-" + strconv.Itoa(id)

@@ -56,6 +56,9 @@ func withProxmoxGuestAccess(cfg core.Config) core.Config {
 func (b *leaseBackend) SupportsRequestedLeaseID() bool { return true }
 
 func (b *leaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	if err := core.ValidateProxmoxGuestConfig(b.Cfg); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	if err := validateProxmoxTemplateCapabilities(b.Cfg); err != nil {
 		return core.LeaseTarget{}, err
 	}
@@ -89,7 +92,7 @@ func validateProxmoxTemplateCapabilities(cfg core.Config) error {
 }
 
 func (b *leaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug string) (core.LeaseTarget, error) {
-	if b.Cfg.Proxmox.TemplateID <= 0 {
+	if b.Cfg.Proxmox.TemplateID <= 0 && core.ProxmoxGuest(b.Cfg) != core.ProxmoxGuestLXC {
 		return core.LeaseTarget{}, core.Exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
 	}
 	client, err := newClient(b.Cfg)
@@ -113,8 +116,8 @@ func (b *leaseBackend) acquireOnce(ctx context.Context, keep bool, requestedSlug
 	cfg.SSHKey = keyPath
 	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
 	cfg.ServerType = (Provider{}).ServerTypeForConfig(cfg)
-	fmt.Fprintf(b.RT.Stderr, "provisioning provider=proxmox lease=%s slug=%s node=%s template=%d keep=%v\n",
-		leaseID, slug, cfg.Proxmox.Node, cfg.Proxmox.TemplateID, keep)
+	fmt.Fprintf(b.RT.Stderr, "provisioning provider=proxmox guest=%s lease=%s slug=%s node=%s template=%s keep=%v\n",
+		core.ProxmoxGuest(cfg), leaseID, slug, cfg.Proxmox.Node, core.ProxmoxTemplateLabel(cfg), keep)
 	server, err := client.CreateServer(ctx, cfg, publicKey, leaseID, slug, keep)
 	if err != nil {
 		return core.LeaseTarget{}, err

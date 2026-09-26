@@ -21,6 +21,15 @@ type ProxmoxConfig struct {
 	// still verifies them in every clone before the lease becomes ready.
 	TemplateDesktop bool `config:"templateDesktop" env:"CRABBOX_PROXMOX_TEMPLATE_DESKTOP" sources:"user,repo,env"`
 	TemplateBrowser bool `config:"templateBrowser" env:"CRABBOX_PROXMOX_TEMPLATE_BROWSER" sources:"user,repo,env"`
+	// Guest selects the lease type: empty or "qemu" clones templateId, and
+	// "lxc" creates an unprivileged container from lxcTemplate with exactly
+	// the resource bounds below. LXC leases are headless.
+	Guest        string `config:"guest" env:"CRABBOX_PROXMOX_GUEST" flag:"proxmox-guest" sources:"user,repo,env,flag" help:"Proxmox lease type: qemu (default) or lxc" fileIgnoreEmpty:"true" fileStorage:"value"`
+	LXCTemplate  string `config:"lxcTemplate" env:"CRABBOX_PROXMOX_LXC_TEMPLATE" flag:"proxmox-lxc-template" sources:"user,repo,env,flag" help:"Proxmox vztmpl volume for LXC leases" fileIgnoreEmpty:"true" fileStorage:"value"`
+	LXCCores     int    `config:"lxcCores" env:"CRABBOX_PROXMOX_LXC_CORES" flag:"proxmox-lxc-cores" sources:"user,repo,env,flag" help:"CPU cores for each LXC lease" nonnegative:"true" fileInt:"positive" envInt:"fallback" fileStorage:"value"`
+	LXCMemoryMiB int    `config:"lxcMemoryMiB" env:"CRABBOX_PROXMOX_LXC_MEMORY_MIB" flag:"proxmox-lxc-memory-mib" sources:"user,repo,env,flag" help:"memory in MiB for each LXC lease" nonnegative:"true" fileInt:"positive" envInt:"fallback" fileStorage:"value"`
+	LXCSwapMiB   int    `config:"lxcSwapMiB" env:"CRABBOX_PROXMOX_LXC_SWAP_MIB" flag:"proxmox-lxc-swap-mib" sources:"user,repo,env,flag" help:"swap in MiB for each LXC lease" nonnegative:"true" fileInt:"positive" envInt:"fallback" fileStorage:"value"`
+	LXCDiskGiB   int    `config:"lxcDiskGiB" env:"CRABBOX_PROXMOX_LXC_DISK_GIB" flag:"proxmox-lxc-disk-gib" sources:"user,repo,env,flag" help:"root disk in GiB for each LXC lease" nonnegative:"true" fileInt:"positive" envInt:"fallback" fileStorage:"value"`
 }
 
 const ProxmoxConfigDefaultWorkRoot string = defaultPOSIXWorkRoot
