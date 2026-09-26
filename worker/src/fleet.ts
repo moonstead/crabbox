@@ -482,6 +482,14 @@ import {
   type WebVNCEmbedState,
 } from "./webvnc-embed";
 import { WebVNCCredentialHandoffs, type WebVNCCredentialHandoffResult } from "./webvnc-handoff";
+import {
+  WebVNCInputTracker,
+  webVNCInputBinding,
+  webVNCInputGateCapability,
+  webVNCInputRequestRefusal,
+  type WebVNCInputAction,
+  type WebVNCInputView,
+} from "./webvnc-input";
 
 const fleetID = "default";
 const maxStoredRunLogBytes = 8 * 1024 * 1024;
@@ -1147,6 +1155,7 @@ export class FleetCoordinator {
   private readonly webVNCAgentCapabilities = new Map<string, Map<string, Set<string>>>();
   private readonly webVNCViewers = new Map<string, Map<string, WebVNCViewerSession>>();
   private readonly webVNCControllers = new Map<string, string>();
+  private readonly webVNCInput = new WebVNCInputTracker();
   private readonly wayVNCRetirement = new WayVNCRetirement();
   private readonly webVNCHandoffs = new Map<
     string,
@@ -2910,6 +2919,7 @@ export class FleetCoordinator {
     switch (attachment.kind) {
       case "webvnc-agent":
         if (this.wayVNCRetirement.handle(socket, message)) break;
+        if (this.webVNCInput.receive(attachment.leaseID, attachment.id, message)) break;
         await forwardOrBufferWebVNC(
           message,
           await this.currentBridgeRecipient(
@@ -2921,6 +2931,14 @@ export class FleetCoordinator {
         break;
       case "webvnc-viewer":
         if (isReservedWebVNCControlFrame(message)) {
+          return;
+        }
+        // noVNC sends only binary frames. Behind an input gate, every text
+        // frame the bridge receives must come from the coordinator itself.
+        if (
+          typeof message === "string" &&
+          this.webVNCAgentHasInputGate(attachment.leaseID, attachment.agentID)
+        ) {
           return;
         }
         await forwardWebVNC(
@@ -8860,6 +8878,9 @@ export class FleetCoordinator {
         if (method === "POST" && parts[5] === "control") {
           return await this.webVNCTakeControl(request, parts[2]);
         }
+        if (method === "POST" && parts[5] === "input") {
+          return await this.webVNCInputChange(request, parts[2], webVNCViewerSession);
+        }
         if (method === "POST" && parts[5] === "theme") {
           return await this.webVNCTheme(request, parts[2]);
         }
@@ -8944,6 +8965,16 @@ export class FleetCoordinator {
       return await this.webVNCTheme(request, parts[2]);
     }
     if (
+      method === "POST" &&
+      parts[1] === "leases" &&
+      parts[2] &&
+      parts[3] === "vnc" &&
+      parts[4] === "input" &&
+      parts[5] === undefined
+    ) {
+      return await this.webVNCInputChange(request, parts[2], webVNCViewerSession);
+    }
+    if (
       method === "GET" &&
       parts[1] === "leases" &&
       parts[2] &&
@@ -8985,7 +9016,7 @@ export class FleetCoordinator {
     return response;
   }
 
-  // Embed session routes (status, control, theme, handoff, viewer) answer a
+  // Embed session routes (status, control, input, theme, handoff, viewer) answer a
   // missing or expired session with JSON that the frame's own script turns
   // into one `session-required` message; the JSON itself is unframeable.
   private webVNCEmbedSessionRequired(request: Request): Response {
@@ -11742,6 +11773,7 @@ export class FleetCoordinator {
         : "none",
       controllerID: controller?.id ?? "",
       controllerLabel: controller?.label ?? "",
+      input: this.webVNCInputView(lease.id, currentViewer?.agentID),
       command,
       events: this.recentWebVNCEvents(lease.id),
       message: bridgeConnected
@@ -11886,6 +11918,106 @@ export class FleetCoordinator {
       command: webVNCBridgeCommand(lease),
       events: this.recentWebVNCEvents(lease.id),
     });
+  }
+
+  private webVNCAgentHasInputGate(leaseID: string, agentID: string): boolean {
+    return (
+      this.webVNCAgentCapabilities.get(leaseID)?.get(agentID)?.has(webVNCInputGateCapability) ===
+      true
+    );
+  }
+
+  private webVNCInputView(leaseID: string, agentID: string | undefined): WebVNCInputView {
+    return this.webVNCInput.view(
+      leaseID,
+      agentID,
+      agentID !== undefined && this.webVNCAgentHasInputGate(leaseID, agentID),
+    );
+  }
+
+  /**
+   * Take or return exclusive desktop input for one of the requester's own
+   * viewers. The guest's gate decides; this only carries the request down
+   * the viewer's own bridge connection.
+   */
+  private async webVNCInputChange(
+    request: Request,
+    identifier: string,
+    viewerSession?: WebVNCPortalViewerSessionRecord,
+  ): Promise<Response> {
+    let trustedOrigin = new URL(request.url).origin;
+    try {
+      if (this.env.CRABBOX_PUBLIC_URL) trustedOrigin = new URL(this.env.CRABBOX_PUBLIC_URL).origin;
+    } catch {
+      trustedOrigin = "";
+    }
+    const refusal = webVNCInputRequestRefusal(request, trustedOrigin);
+    if (refusal) {
+      return json({ error: refusal.error, message: refusal.message }, { status: refusal.status });
+    }
+    const lease = await this.resolvePortalLease(identifier, request);
+    if (!lease) {
+      return notFound();
+    }
+    const error = webVNCLeaseError(lease);
+    if (error) {
+      return json({ error: "webvnc_unavailable", message: error }, { status: 409 });
+    }
+    const input = await readJson<{ viewerID?: unknown; action?: unknown }>(request).catch(
+      () => ({}) as { viewerID?: unknown; action?: unknown },
+    );
+    const viewerID = typeof input.viewerID === "string" ? input.viewerID : "";
+    const action = input.action;
+    if (!validWebVNCSessionID(viewerID) || (action !== "take" && action !== "return")) {
+      return json(
+        {
+          error: "invalid_request",
+          message: "a viewer id and an action of take or return are required",
+        },
+        { status: 400 },
+      );
+    }
+    const viewer = this.webVNCViewers.get(lease.id)?.get(viewerID);
+    if (!viewer || viewer.socket.readyState !== WebSocket.OPEN) {
+      return json(
+        { error: "viewer_not_connected", message: "viewer is not connected" },
+        { status: 409 },
+      );
+    }
+    // Only the viewer's own session may change its control.
+    const ownViewer = viewerSession
+      ? viewer.viewerSessionID === viewerSession.session
+      : viewer.viewerSessionID === undefined && viewer.owner === requestOwner(request);
+    if (!ownViewer) {
+      return json(
+        { error: "viewer_not_connected", message: "viewer is not connected" },
+        { status: 409 },
+      );
+    }
+    const agent = await this.currentBridgeRecipient(
+      this.webVNCAgents.get(lease.id)?.get(viewer.agentID),
+    );
+    if (!agent || !this.webVNCAgentHasInputGate(lease.id, viewer.agentID)) {
+      return json(
+        {
+          error: "input_gate_unavailable",
+          message: "This desktop does not have exclusive input control.",
+        },
+        { status: 409 },
+      );
+    }
+    const result = await this.webVNCInput.request(
+      lease.id,
+      viewer.agentID,
+      agent,
+      action as WebVNCInputAction,
+    );
+    this.recordWebVNCEvent(
+      lease.id,
+      result.ok ? (action === "take" ? "input_taken" : "input_returned") : "input_refused",
+      viewer.label,
+    );
+    return json({ leaseID: lease.id, viewerID, ...result }, { status: result.ok ? 200 : 409 });
   }
 
   private async webVNCTakeControl(request: Request, identifier: string): Promise<Response> {
@@ -12975,6 +13107,14 @@ export class FleetCoordinator {
       const viewerID = validWebVNCSessionID(requestedViewerID)
         ? requestedViewerID
         : newWebVNCSessionID("viewer");
+      // A gate grants input per viewer session; a viewer without a portal
+      // session is its own session for this connection only.
+      const inputBinding = this.webVNCAgentHasInputGate(lease.id, agent.id)
+        ? await webVNCInputBinding(
+            lease.id,
+            viewerSession ? `session:${viewerSession.session}` : `viewer:${owner}:${viewerID}`,
+          )
+        : undefined;
 
       const upgrade = this.state.createWebSocketUpgrade();
       const viewer = upgrade.socket;
@@ -13002,6 +13142,12 @@ export class FleetCoordinator {
         this.webVNCControllers.set(lease.id, viewerID);
         this.recordWebVNCEvent(lease.id, "control_taken", `${label} is controlling`);
       }
+      if (inputBinding) {
+        // Sent before the viewer's first frame can reach the bridge.
+        agent.socket.send(
+          JSON.stringify({ type: "input_binding", lease: lease.id, binding: inputBinding }),
+        );
+      }
       this.recordWebVNCEvent(lease.id, "viewer_connected", label);
       this.acceptBridgeWebSocket(viewer, {
         kind: "webvnc-viewer",
@@ -13026,6 +13172,7 @@ export class FleetCoordinator {
       return;
     }
     agents.delete(agentID);
+    this.webVNCInput.forget(leaseID, agentID);
     const capabilities = this.webVNCAgentCapabilities.get(leaseID);
     capabilities?.delete(agentID);
     if (capabilities?.size === 0) {
@@ -13052,6 +13199,7 @@ export class FleetCoordinator {
     this.recordWebVNCEvent(leaseID, "viewer_disconnected", viewer.label);
     const agent = this.webVNCAgents.get(leaseID)?.get(viewer.agentID);
     closeSocket(agent, 1011, "WebVNC viewer disconnected");
+    this.webVNCInput.forget(leaseID, viewer.agentID);
     const agents = this.webVNCAgents.get(leaseID);
     agents?.delete(viewer.agentID);
     if (agents?.size === 0) {
@@ -23817,15 +23965,16 @@ function webVNCAgentCapabilities(request: Request): Set<string> {
   );
 }
 
-function isReservedWebVNCControlFrame(message: unknown): boolean {
-  if (typeof message !== "string" || message[0] !== "{") {
+export function isReservedWebVNCControlFrame(message: unknown): boolean {
+  if (typeof message !== "string" || message.trimStart()[0] !== "{") {
     return false;
   }
   try {
     const parsed = JSON.parse(message) as { type?: unknown };
     return (
       parsed.type === "desktop_theme" ||
-      (typeof parsed.type === "string" && parsed.type.startsWith("wayvnc_"))
+      (typeof parsed.type === "string" &&
+        (parsed.type.startsWith("wayvnc_") || parsed.type.startsWith("input_")))
     );
   } catch {
     return false;
