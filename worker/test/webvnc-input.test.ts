@@ -160,6 +160,7 @@ function harness(capabilities: string[]) {
     webVNCInputView(leaseID: string, agentID: string | undefined): unknown;
   };
   Object.assign(fleet, {
+    env: {},
     webVNCInput: new WebVNCInputTracker(),
     webVNCViewers: new Map([[leaseID, new Map(viewers.map((viewer) => [viewer.id, viewer]))]]),
     webVNCAgents: new Map([
@@ -189,10 +190,19 @@ function harness(capabilities: string[]) {
     }),
     currentBridgeRecipient: async (socket: WebSocket | undefined) => socket,
   });
-  const change = (viewerID: string, action: string, session: string) =>
+  const change = (
+    viewerID: string,
+    action: string,
+    session: string,
+    headers: Record<string, string> = {
+      origin: "https://crabbox.test",
+      "content-type": "application/json",
+    },
+  ) =>
     fleet.webVNCInputChange(
       new Request("https://crabbox.test/portal/leases/x/vnc/input", {
         method: "POST",
+        headers,
         body: JSON.stringify({ viewerID, action }),
       }),
       leaseID,
@@ -246,6 +256,27 @@ describe("POST /portal/leases/{lease}/vnc/input", () => {
     const response = await change("viewer_person", "take", "webvnc_session_person");
     expect(response.status).toBe(409);
     await expect(response.json()).resolves.toMatchObject({ error: "input_gate_unavailable" });
+    expect(sent).toEqual([]);
+  });
+
+  it("requires the exact coordinator Origin and a JSON body", async () => {
+    const { sent, change } = harness(["input_gate"]);
+    const cases: Array<[Record<string, string>, number]> = [
+      [{ "content-type": "application/json" }, 403],
+      [{ origin: "https://evil.test", "content-type": "application/json" }, 403],
+      [{ origin: "https://crabbox.test.evil.test", "content-type": "application/json" }, 403],
+      [{ origin: "null", "content-type": "application/json" }, 403],
+      [{ origin: "https://crabbox.test", "content-type": "text/plain" }, 415],
+      [
+        { origin: "https://crabbox.test", "content-type": "application/x-www-form-urlencoded" },
+        415,
+      ],
+      [{ origin: "https://crabbox.test" }, 415],
+    ];
+    const responses = await Promise.all(
+      cases.map(([headers]) => change("viewer_person", "take", "webvnc_session_person", headers)),
+    );
+    expect(responses.map((response) => response.status)).toEqual(cases.map(([, status]) => status));
     expect(sent).toEqual([]);
   });
 
@@ -323,6 +354,9 @@ describe("WebVNC viewer page", () => {
     expect(body).toContain("inputGate = state.input?.gate === true ? state.input : null;");
     expect(body).toContain('inputGate ? inputGate.holder === "self" : role === "controller"');
     expect(body).toContain('"return to agent"');
+    // Take and return switch desktops; the page reconnects instead of failing.
+    expect(body).toContain("inputSwitchPending = true;");
+    expect(body).toContain('setStatus("switching desktops");');
   });
 
   it("uses the embed viewer's own input route", async () => {

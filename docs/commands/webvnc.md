@@ -195,9 +195,10 @@ connected:
   A reconnect of the same viewer session gets the same binding.
 - The viewer page asks for control with
   `POST /portal/leases/{lease}/vnc/input` (`/vnc/embed/input` for the
-  embedded viewer) and `{"viewerID": ..., "action": "take" | "return"}`. The coordinator accepts
-  it only for the requester's own viewer session and carries it down that
-  viewer's own bridge connection as `input_request`.
+  embedded viewer) and `{"viewerID": ..., "action": "take" | "return"}`. The
+  route accepts only the coordinator's exact `Origin` and a JSON body, and
+  only for the requester's own viewer session. The coordinator carries it
+  down that viewer's own bridge connection as `input_request`.
 - The gate decides and answers with `input_result`, and reports changes with
   `input_state`. `GET .../vnc/status` returns them as
   `input: {gate, owner, holder}`, where `owner` is `agent`, `human` or `none`
@@ -209,7 +210,10 @@ connected:
   gate parses and filters.
 
 The gate, not the viewer page, enforces input: a viewer that does not hold
-control is view-only whatever its client does. The page mirrors the state by
+control is view-only whatever its client does. A gate may relay to a
+different desktop after a take or return; Stead's gate gives the person a
+separate desktop. It then ends each viewer's connection after answering, and
+the viewer page reconnects to the desktop that now has control. The page mirrors the state by
 setting noVNC's `viewOnly` and shows **take control** or **return to agent**.
 Stead's guest implements a gate; see its `docs/desktop-input.md`.
 

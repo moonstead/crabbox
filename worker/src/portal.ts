@@ -1445,6 +1445,9 @@ export function portalVNC(
       // enforces it in the guest; viewOnly here only mirrors it.
       let inputGate = null;
       const inputTimeoutMs = 60000;
+      // Take and return switch the gate between the agent's desktop and a
+      // fresh one for the person, which ends this connection on purpose.
+      let inputSwitchPending = false;
       let controllerID = "";
       let sizingOwnerChanged = false;
       let sizingHandoffPending = false;
@@ -1707,7 +1710,8 @@ export function portalVNC(
         controlPending = true;
         const button = document.getElementById("vnc-takeover");
         if (button) button.disabled = true;
-        setStatus(action === "take" ? "pausing the agent" : "returning control to the agent");
+        setStatus(action === "take" ? "starting your desktop" : "returning control to the agent");
+        inputSwitchPending = true;
         try {
           const { response, result } = await collaborationOperation(async (signal) => {
             const response = await fetch(inputURL, {
@@ -1720,7 +1724,10 @@ export function portalVNC(
             return { response, result };
           }, inputTimeoutMs);
           if (!connected || epoch !== connectionEpoch) return;
-          if (!response.ok) throw new Error(result.message || "control did not change");
+          if (!response.ok) {
+            inputSwitchPending = false;
+            throw new Error(result.message || "control did not change");
+          }
         } finally {
           if (epoch === connectionEpoch) controlPending = false;
         }
@@ -1865,6 +1872,15 @@ export function portalVNC(
             if (!current()) return;
             const wasConnected = connected;
             retireConnection();
+            if (inputSwitchPending) {
+              // Expected: reconnect to the desktop that now has control.
+              inputSwitchPending = false;
+              retryAttempt = 0;
+              setStatus("switching desktops");
+              window.clearTimeout(retryTimer);
+              retryTimer = window.setTimeout(connect, 500);
+              return;
+            }
             if (wasConnected) notifyEmbedHost("disconnected");
             if (!wasConnected && (authenticationFailed || credentialsSent)) {
               stopPolling(authenticationFailed ? failedVNCCredentialMessage : words.authTimeout);

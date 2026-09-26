@@ -486,6 +486,7 @@ import {
   WebVNCInputTracker,
   webVNCInputBinding,
   webVNCInputGateCapability,
+  webVNCInputRequestRefusal,
   type WebVNCInputAction,
   type WebVNCInputView,
 } from "./webvnc-input";
@@ -11944,6 +11945,16 @@ export class FleetCoordinator {
     identifier: string,
     viewerSession?: WebVNCPortalViewerSessionRecord,
   ): Promise<Response> {
+    let trustedOrigin = new URL(request.url).origin;
+    try {
+      if (this.env.CRABBOX_PUBLIC_URL) trustedOrigin = new URL(this.env.CRABBOX_PUBLIC_URL).origin;
+    } catch {
+      trustedOrigin = "";
+    }
+    const refusal = webVNCInputRequestRefusal(request, trustedOrigin);
+    if (refusal) {
+      return json({ error: refusal.error, message: refusal.message }, { status: refusal.status });
+    }
     const lease = await this.resolvePortalLease(identifier, request);
     if (!lease) {
       return notFound();

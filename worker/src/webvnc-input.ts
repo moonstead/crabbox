@@ -34,6 +34,35 @@ const refusalMessages: Record<string, string> = {
 
 export type WebVNCInputAction = "take" | "return";
 
+/**
+ * Take and return change who may give a desktop input, so they accept only a
+ * same-origin JSON request from the viewer page itself: the exact Origin of
+ * the coordinator, and a JSON body. This holds even for callers the portal's
+ * cookie gate would let through.
+ */
+export function webVNCInputRequestRefusal(
+  request: Request,
+  trustedOrigin: string,
+): { status: number; error: string; message: string } | undefined {
+  const origin = request.headers.get("origin");
+  if (origin === null || origin !== trustedOrigin) {
+    return {
+      status: 403,
+      error: "input_origin_forbidden",
+      message: "take and return must come from the viewer page",
+    };
+  }
+  const type = (request.headers.get("content-type") ?? "").trim().toLowerCase();
+  if (type !== "application/json" && type !== "application/json; charset=utf-8") {
+    return {
+      status: 415,
+      error: "unsupported_media_type",
+      message: "take and return need a JSON body",
+    };
+  }
+  return undefined;
+}
+
 export interface WebVNCInputView {
   gate: boolean;
   owner?: "agent" | "human" | "none";
