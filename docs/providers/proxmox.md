@@ -370,7 +370,11 @@ For each lease, Crabbox:
    not a volume of the requested size on the requested storage or carries any
    other option, or `net0` is not exactly `name=eth0`, the requested bridge,
    `ip=dhcp` and `type=veth` plus the MAC address Proxmox assigns. A refused
-   container is deleted, or kept in fixed custody for checked release. A
+   container is kept in fixed custody for checked release. An ordinary
+   create deletes it only through the same checked path, bound to the
+   generation this create produced and re-read immediately before the stop
+   and before the purge; when that identity is missing, changed or
+   unreadable, the container is retained and the failure reports it. A
    failed tag update is treated the same way; it is not a rejected create.
 3. Starts it and reads eth0's IPv4 address from
    `/nodes/<node>/lxc/<vmid>/interfaces`. There is no guest agent.
@@ -436,10 +440,11 @@ lxc_permissions
            storage, the bridge's SDN zone and the node grant every privilege
            the container lifecycle and prepared-claim recovery need
 lxc_tag_policy
-           guest=lxc only: /cluster/options shows that this principal may
-           add the crabbox tag (not a registered tag; user-tag-access free,
-           or list or existing with the tag allowed); unreadable policy is
-           reported as unverified and not ready
+           guest=lxc only: the principal holds effective Sys.Audit on /,
+           and /cluster/options then shows that it may add the crabbox tag
+           (not a registered tag; user-tag-access free, or list or existing
+           with the tag allowed); without Sys.Audit the options omit the
+           policy, so it is reported as unverified and not ready
 nextid     /cluster/nextid is readable
 pool       configured /pools/<pool> is readable, when set
 inventory  /vms has propagated VM.Audit and cluster inventory is readable

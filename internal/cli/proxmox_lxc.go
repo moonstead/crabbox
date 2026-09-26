@@ -184,27 +184,32 @@ func (c *ProxmoxClient) createLXCServer(ctx context.Context, cfg Config, publicK
 		return Server{}, err
 	}
 	createdID := strconv.Itoa(vmid)
-	cleanup := func() {
-		// An uncertain fixed attempt remains in custody for checked release.
+	// cleanup settles a failed ordinary create. It deletes only a container
+	// that still carries the generation this invocation created, re-read
+	// immediately before the stop and again before the purge. When that
+	// identity is missing, changed or unreadable, the container is retained
+	// and the failure reports the uncertainty. A fixed attempt is always
+	// retained in custody for checked release.
+	cleanup := func(cause error) error {
 		if fixed {
-			return
+			return cause
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		_ = c.DeleteServer(cleanupCtx, createdID)
+		if err := c.lxcDeleteCreated(cleanupCtx, vmid, generation); err != nil {
+			return fmt.Errorf("%w; container %d retained: %v", cause, vmid, err)
+		}
+		return cause
 	}
 	if err := c.waitTask(ctx, upid); err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	server, err := c.getServer(ctx, createdID, true)
 	if err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	if server.ImmutableID != generation {
-		cleanup()
-		return Server{}, fmt.Errorf("proxmox container %d does not carry the generation Crabbox created", vmid)
+		return Server{}, cleanup(fmt.Errorf("proxmox container %d does not carry the generation Crabbox created", vmid))
 	}
 	if fixed {
 		if err := bind(server); err != nil {
@@ -214,34 +219,45 @@ func (c *ProxmoxClient) createLXCServer(ctx context.Context, cfg Config, publicK
 	// Proxmox checks tags against /vms/<vmid> alone, without the pool, so a
 	// pool-scoped token may set them only once the container is a pool member.
 	if err := c.lxcApplyTag(ctx, vmid, generation); err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	// Audit after binding so a refused container stays in fixed custody and
 	// ordinary checked release can delete it.
 	if err := c.auditLXCConfig(ctx, vmid, cfg, name); err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	if err := c.startVM(ctx, vmid); err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	server, err = c.waitServerIP(ctx, vmid)
 	if err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	if err := c.bootstrapSSH(ctx, server.PublicNet.IPv4.IP, cfg); err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	server, err = c.GetServer(ctx, createdID)
 	if err != nil {
-		cleanup()
-		return Server{}, err
+		return Server{}, cleanup(err)
 	}
 	return server, nil
+}
+
+// lxcDeleteCreated deletes the container at vmid only while it carries the
+// generation this process created. Every destructive step re-reads the
+// container first; a missing, different or unreadable identity retains it.
+// A container that is already absent needs nothing.
+func (c *ProxmoxClient) lxcDeleteCreated(ctx context.Context, vmid int, generation string) error {
+	err := c.DeleteServerOnNodeChecked(ctx, c.Node, strconv.Itoa(vmid), func(live Server) error {
+		if live.ImmutableID != generation {
+			return fmt.Errorf("container %d no longer carries the generation this create produced", vmid)
+		}
+		return nil
+	})
+	if IsProxmoxNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // proxmoxLXCCreateForm is the complete create request. It names no feature,
@@ -740,10 +756,22 @@ func (c *ProxmoxClient) proxmoxLXCTagPolicyCheck(ctx context.Context) ProxmoxRea
 			UserAllowList []string `json:"user-allow-list"`
 		} `json:"user-tag-access"`
 	}
+	// /cluster/options answers every authenticated principal, but without
+	// Sys.Audit on / it returns only presentation options and omits the tag
+	// policy, and an omitted policy looks exactly like the default. Confirm
+	// the effective privilege first, so a filtered answer is never read as
+	// "free".
+	var permissions map[string]map[string]proxmoxInt
+	if err := c.doRequired(ctx, http.MethodGet, "/access/permissions?path=%2F", nil, &permissions); err != nil {
+		return c.proxmoxFailedReadiness("lxc_tag_policy", "/access/permissions?path=/", err, map[string]string{"tag": proxmoxLeaseTag})
+	}
+	if _, ok := permissions["/"]["Sys.Audit"]; !ok {
+		return failed("permission", "grant_sys_audit_on_root", "tag policy unverified: without Sys.Audit on / the datacenter options omit registered-tags and user-tag-access")
+	}
 	if err := c.doRequired(ctx, http.MethodGet, "/cluster/options", nil, &options); err != nil {
 		var apiErr *ProxmoxError
 		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusForbidden || apiErr.StatusCode == http.StatusUnauthorized) {
-			return failed("permission", "grant_sys_audit_on_root", "tag policy unverified: /cluster/options needs Sys.Audit on /")
+			return failed("permission", "grant_sys_audit_on_root", "tag policy unverified: /cluster/options refused")
 		}
 		return c.proxmoxFailedReadiness("lxc_tag_policy", "/cluster/options", err, map[string]string{"tag": proxmoxLeaseTag})
 	}

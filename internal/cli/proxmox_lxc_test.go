@@ -64,6 +64,11 @@ type fakeProxmoxLXCAPI struct {
 	// write must be refused for a stale digest.
 	raceOnRead bool
 	digests    int
+	// replaceAfterReads replaces the container behind the VMID after the
+	// Nth configuration read: a new generation and a new digest.
+	replaceAfterReads int
+	configReads       int
+	replaced          string
 }
 
 func (f *fakeProxmoxLXCAPI) bumpDigest() {
@@ -120,7 +125,13 @@ func (f *fakeProxmoxLXCAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/lxc/1000/config":
 		f.events = append(f.events, "config")
 		reply(f.config)
+		f.configReads++
 		if f.raceOnRead {
+			f.bumpDigest()
+		}
+		if f.replaceAfterReads != 0 && f.configReads == f.replaceAfterReads {
+			f.replaced = strings.Repeat("ee", 16)
+			f.config["description"] = "crabbox labels\nlease=cbx_other\n" + ProxmoxLXCGenerationLabel + "=" + f.replaced + "\n"
 			f.bumpDigest()
 		}
 	case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/lxc/1000/status/start":
@@ -617,6 +628,8 @@ func TestProxmoxLXCDoctorReadiness(t *testing.T) {
 						reply(map[string]any{path: map[string]int{"Datastore.Audit": 1, "VM.Audit": 1}})
 					case "/sdn/zones/localnetwork/vmbr0":
 						reply(map[string]any{path: map[string]int{"SDN.Use": 1}})
+					case "/":
+						reply(map[string]any{path: map[string]int{"Sys.Audit": 1}})
 					case "/nodes/pve1":
 						reply(map[string]any{path: tc.nodePrivs})
 					default:
@@ -659,6 +672,7 @@ func TestProxmoxLXCDoctorTagPolicy(t *testing.T) {
 	for name, tc := range map[string]struct {
 		options   any
 		status    int
+		noAudit   bool
 		resources []any
 		want      string
 		hint      string
@@ -671,11 +685,20 @@ func TestProxmoxLXCDoctorTagPolicy(t *testing.T) {
 		"existing without tag":     {options: map[string]any{"user-tag-access": map[string]any{"user-allow": "existing"}}, want: "failed", hint: "add_lease_tag_to_user_allow_list"},
 		"none":                     {options: map[string]any{"user-tag-access": map[string]any{"user-allow": "none"}}, want: "failed", hint: "set_user_tag_access"},
 		"policy unreadable":        {status: http.StatusForbidden, want: "failed", hint: "grant_sys_audit_on_root"},
+		// Without Sys.Audit on / Proxmox answers with presentation options
+		// only; the omitted policy must not be read as the default.
+		"filtered without Sys.Audit": {options: map[string]any{"allowed-tags": []string{}, "console": "html5"}, noAudit: true, want: "failed", hint: "grant_sys_audit_on_root"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				reply := func(data any) { _ = json.NewEncoder(w).Encode(map[string]any{"data": data}) }
 				switch r.URL.Path {
+				case "/api2/json/access/permissions":
+					privileges := map[string]int{"Sys.Audit": 1}
+					if tc.noAudit {
+						privileges = map[string]int{"Datastore.Audit": 1}
+					}
+					reply(map[string]any{r.URL.Query().Get("path"): privileges})
 				case "/api2/json/cluster/options":
 					if tc.status != 0 {
 						w.WriteHeader(tc.status)
@@ -804,6 +827,59 @@ func TestProxmoxLXCLabelWriteIsFencedOnDigest(t *testing.T) {
 			}
 			if labels := proxmoxDescriptionLabels(api.config["description"].(string)); labels["state"] != "ready" || labels[ProxmoxLXCGenerationLabel] != created.ImmutableID {
 				t.Fatalf("labels=%v", labels)
+			}
+		})
+	}
+}
+
+// A replacement behind the VMID between the identity read and a later step
+// must never be deleted by the create's own cleanup: the tag write is refused
+// on the digest, and cleanup re-reads the generation before any stop or
+// delete, retains the container and reports the uncertainty.
+func TestProxmoxLXCCreateCleanupNeverDeletesAReplacement(t *testing.T) {
+	for name, tc := range map[string]struct {
+		replaceAfterReads int
+		fixed             bool
+		wantErr           string
+	}{
+		"replaced between the tag read and the tag PUT":        {replaceAfterReads: 2, wantErr: "modified configuration"},
+		"replaced between the identity read and the tag read":  {replaceAfterReads: 1, wantErr: "generation changed before its tag was applied"},
+		"fixed: replaced between the tag read and the tag PUT": {replaceAfterReads: 2, fixed: true, wantErr: "modified configuration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeProxmoxLXCAPI{t: t, replaceAfterReads: tc.replaceAfterReads}
+			server := httptest.NewServer(api)
+			defer server.Close()
+			installProxmoxLXCSSHFake(t)
+			cfg := proxmoxLXCTestConfig(server.URL)
+			client, err := NewProxmoxClient(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var labels map[string]string
+			var bind func(Server) error
+			if tc.fixed {
+				labels = map[string]string{"fixed_intent_sha256": strings.Repeat("a", 64)}
+				bind = func(Server) error { return nil }
+			}
+			_, err = client.CreateServerWithVMID(context.Background(), cfg, "ssh-ed25519 AAAAfixture", "cbx_123456abcdef", "blue-crab", false, 1000, labels, bind)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err=%v", err)
+			}
+			if !tc.fixed && !strings.Contains(err.Error(), "retained") {
+				t.Fatalf("ordinary cleanup did not report the retained container: %v", err)
+			}
+			for _, event := range api.events {
+				switch event {
+				case "delete", "stop", "stop-refused", "start":
+					t.Fatalf("destructive request %s reached the replacement: %v", event, api.events)
+				}
+			}
+			if api.deleted || api.running {
+				t.Fatalf("replacement deleted=%v running=%v", api.deleted, api.running)
+			}
+			if got := proxmoxDescriptionLabels(api.config["description"].(string))[ProxmoxLXCGenerationLabel]; got != api.replaced {
+				t.Fatalf("replacement identity changed: %s", got)
 			}
 		})
 	}
