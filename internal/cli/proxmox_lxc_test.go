@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,9 @@ type fakeProxmoxLXCAPI struct {
 	events   []string
 	deleteQS url.Values
 	extra    map[string]any
+	puts     []url.Values
+	// status overrides the reported container state when set.
+	status string
 }
 
 func (f *fakeProxmoxLXCAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,8 +67,8 @@ func (f *fakeProxmoxLXCAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.config = map[string]any{
 			"arch": "amd64", "ostype": "ubuntu", "digest": "d",
 			"hostname": f.create.Get("hostname"), "description": f.create.Get("description"),
-			"tags": f.create.Get("tags"), "unprivileged": 1,
-			"cores": 2, "memory": 4096, "swap": 512, "onboot": 0,
+			"unprivileged": 1,
+			"cores":        2, "memory": 4096, "swap": 512, "onboot": 0,
 			"rootfs": "local-lvm:vm-1000-disk-0,size=16G",
 			"net0":   "name=eth0,bridge=vmbr0,hwaddr=BC:24:11:00:00:01,ip=dhcp,type=veth",
 		}
@@ -85,6 +89,9 @@ func (f *fakeProxmoxLXCAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.running {
 			status = "running"
 		}
+		if f.status != "" {
+			status = f.status
+		}
 		reply(map[string]any{"vmid": 1000, "name": f.config["hostname"], "status": status})
 	case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/lxc/1000/config":
 		f.events = append(f.events, "config")
@@ -94,9 +101,24 @@ func (f *fakeProxmoxLXCAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.running = true
 		reply("UPID:pve1:vzstart")
 	case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/lxc/1000/status/stop":
+		if !f.running {
+			// Proxmox dies with "CT <vmid> not running", an HTTP 500.
+			f.events = append(f.events, "stop-refused")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"data":null,"errors":{"vmid":"CT 1000 not running"}}`))
+			return
+		}
 		f.events = append(f.events, "stop")
 		f.running = false
 		reply("UPID:pve1:vzstop")
+	case r.Method == http.MethodPut && r.URL.Path == "/api2/json/nodes/pve1/lxc/1000/config":
+		form := readForm(f.t, r)
+		f.puts = append(f.puts, form)
+		f.events = append(f.events, "put")
+		for key := range form {
+			f.config[key] = form.Get(key)
+		}
+		reply(nil)
 	case r.Method == http.MethodDelete && r.URL.Path == "/api2/json/nodes/pve1/lxc/1000":
 		f.events = append(f.events, "delete")
 		f.deleteQS = r.URL.Query()
@@ -160,7 +182,7 @@ func TestProxmoxLXCCreateServerFlow(t *testing.T) {
 	for key, want := range map[string]string{
 		"vmid": "1000", "ostemplate": proxmoxLXCTestTemplate, "unprivileged": "1",
 		"ssh-public-keys": "ssh-ed25519 AAAAfixture lease", "rootfs": "local-lvm:16",
-		"cores": "2", "memory": "4096", "swap": "512", "pool": "stead-lxc", "tags": "crabbox",
+		"cores": "2", "memory": "4096", "swap": "512", "pool": "stead-lxc",
 		"net0": "name=eth0,bridge=vmbr0,ip=dhcp,type=veth", "onboot": "0", "start": "0",
 		"hostname": LeaseProviderName("cbx_123456abcdef", "blue-crab"),
 	} {
@@ -170,9 +192,14 @@ func TestProxmoxLXCCreateServerFlow(t *testing.T) {
 	}
 	for key := range form {
 		switch key {
-		case "features", "mp0", "dev0", "hookscript", "lxc", "password", "restore", "force":
+		case "features", "mp0", "dev0", "hookscript", "lxc", "password", "restore", "force", "tags":
+			// Proxmox checks tags on /vms/<vmid> without the pool ACL, so a
+			// pool-scoped token cannot set them at create time.
 			t.Errorf("create requested forbidden %s", key)
 		}
+	}
+	if len(api.puts) != 1 || api.puts[0].Get("tags") != "crabbox" || len(api.puts[0]) != 1 {
+		t.Fatalf("tags were not applied in one configuration update after create: %v", api.puts)
 	}
 	labels := proxmoxDescriptionLabels(form.Get("description"))
 	generation := labels[ProxmoxLXCGenerationLabel]
@@ -185,7 +212,7 @@ func TestProxmoxLXCCreateServerFlow(t *testing.T) {
 	if len(*targets) != 1 || (*targets)[0].User != "root" || (*targets)[0].Host != "192.0.2.61" {
 		t.Fatalf("bootstrap targets=%+v", *targets)
 	}
-	if !reflect.DeepEqual(api.events[:5], []string{"create", "wait", "config", "config", "start"}) {
+	if !reflect.DeepEqual(api.events[:6], []string{"create", "wait", "config", "put", "config", "start"}) {
 		t.Fatalf("events=%v", api.events)
 	}
 }
@@ -217,6 +244,11 @@ func TestProxmoxLXCCreateRefusesUnexpectedConfiguration(t *testing.T) {
 			if api.running || !api.deleted || api.deleteQS.Get("purge") != "1" || api.deleteQS.Get("destroy-unreferenced-disks") != "1" {
 				t.Fatalf("refused container not removed: events=%v query=%v", api.events, api.deleteQS)
 			}
+			for _, event := range api.events {
+				if event == "stop" || event == "stop-refused" {
+					t.Fatalf("a container that never started was asked to stop: %v", api.events)
+				}
+			}
 		})
 	}
 }
@@ -242,6 +274,78 @@ func TestProxmoxLXCFixedCreateBindsBeforeAuditAndKeepsCustody(t *testing.T) {
 	}
 	if api.deleted || api.running {
 		t.Fatalf("fixed refused container left custody: events=%v", api.events)
+	}
+	// Checked release must delete the never-started container without a stop
+	// request, which Proxmox would refuse.
+	checks := 0
+	err = client.DeleteServerOnNodeChecked(context.Background(), "pve1", "1000", func(live Server) error {
+		checks++
+		if live.ImmutableID != bound.ImmutableID {
+			return fmt.Errorf("identity changed")
+		}
+		return nil
+	})
+	if err != nil || checks != 2 || !api.deleted || api.deleteQS.Get("purge") != "1" || api.deleteQS.Get("destroy-unreferenced-disks") != "1" {
+		t.Fatalf("checked release of the refused container: err=%v checks=%d events=%v", err, checks, api.events)
+	}
+	for _, event := range api.events {
+		if event == "stop" || event == "stop-refused" {
+			t.Fatalf("checked release asked a stopped container to stop: %v", api.events)
+		}
+	}
+}
+
+func TestProxmoxLXCCheckedReleaseHandlesStoppedAndUnknownContainers(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status  string
+		wantErr bool
+		stop    bool
+	}{
+		"running":  {status: "", stop: true},
+		"stopped":  {status: "stopped"},
+		"unknown":  {status: "unknown", wantErr: true},
+		"no state": {status: " ", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeProxmoxLXCAPI{t: t}
+			server := httptest.NewServer(api)
+			defer server.Close()
+			installProxmoxLXCSSHFake(t)
+			cfg := proxmoxLXCTestConfig(server.URL)
+			client, err := NewProxmoxClient(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.CreateServerWithVMID(context.Background(), cfg, "ssh-ed25519 AAAAfixture", "cbx_123456abcdef", "blue-crab", false, 1000, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			// The container exited on its own, or reports a state Crabbox
+			// does not understand.
+			switch tc.status {
+			case "":
+			case "stopped":
+				api.running = false
+			default:
+				api.status = tc.status
+			}
+			api.events = nil
+			err = client.DeleteServerOnNodeChecked(context.Background(), "pve1", "1000", func(Server) error { return nil })
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v events=%v", err, api.events)
+			}
+			stopped := false
+			for _, event := range api.events {
+				if event == "stop-refused" {
+					t.Fatalf("stop was sent to a container that is not running: %v", api.events)
+				}
+				if event == "stop" {
+					stopped = true
+				}
+			}
+			if stopped != tc.stop || api.deleted == tc.wantErr {
+				t.Fatalf("stopped=%v deleted=%v events=%v", stopped, api.deleted, api.events)
+			}
+		})
 	}
 }
 
@@ -407,6 +511,7 @@ func TestProxmoxLXCDoctorReadiness(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		poolPrivs    map[string]int
+		nodePrivs    map[string]int
 		volumes      []any
 		wantTemplate string
 		wantPerms    string
@@ -414,8 +519,16 @@ func TestProxmoxLXCDoctorReadiness(t *testing.T) {
 		{
 			name:         "ready",
 			poolPrivs:    map[string]int{"VM.Allocate": 1, "VM.Audit": 1, "VM.Config.CPU": 1, "VM.Config.Disk": 1, "VM.Config.Memory": 1, "VM.Config.Network": 1, "VM.Config.Options": 1, "VM.PowerMgmt": 1},
+			nodePrivs:    map[string]int{"Sys.Audit": 1},
 			volumes:      []any{map[string]any{"volid": proxmoxLXCTestTemplate, "content": "vztmpl"}},
 			wantTemplate: "ok", wantPerms: "ok",
+		},
+		{
+			name:         "missing node audit for prepared-claim recovery",
+			poolPrivs:    map[string]int{"VM.Allocate": 1, "VM.Audit": 1, "VM.Config.CPU": 1, "VM.Config.Disk": 1, "VM.Config.Memory": 1, "VM.Config.Network": 1, "VM.Config.Options": 1, "VM.PowerMgmt": 1},
+			nodePrivs:    map[string]int{},
+			volumes:      []any{map[string]any{"volid": proxmoxLXCTestTemplate, "content": "vztmpl"}},
+			wantTemplate: "ok", wantPerms: "failed",
 		},
 		{
 			name:         "missing resource privileges and template",
@@ -450,6 +563,10 @@ func TestProxmoxLXCDoctorReadiness(t *testing.T) {
 						reply(map[string]any{path: map[string]int{"Datastore.AllocateSpace": 1, "Datastore.Audit": 1}})
 					case "/storage/local", "/vms":
 						reply(map[string]any{path: map[string]int{"Datastore.Audit": 1, "VM.Audit": 1}})
+					case "/sdn/zones/localnetwork/vmbr0":
+						reply(map[string]any{path: map[string]int{"SDN.Use": 1}})
+					case "/nodes/pve1":
+						reply(map[string]any{path: tc.nodePrivs})
 					default:
 						t.Errorf("permission path %q", path)
 					}
@@ -484,23 +601,46 @@ func TestProxmoxLXCDoctorReadiness(t *testing.T) {
 	}
 }
 
-func TestProxmoxLXCSetLabelsUsesContainerConfigPut(t *testing.T) {
-	var method, path string
-	var form url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		method, path, form = r.Method, r.URL.Path, readForm(t, r)
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": nil})
-	}))
-	defer server.Close()
-	client, err := NewProxmoxClient(proxmoxLXCTestConfig(server.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := client.SetLabelsOnNode(context.Background(), "pve1", "1000", map[string]string{"state": "ready", ProxmoxLXCGenerationLabel: strings.Repeat("ab", 16)}); err != nil {
-		t.Fatal(err)
-	}
-	labels := proxmoxDescriptionLabels(form.Get("description"))
-	if method != http.MethodPut || path != "/api2/json/nodes/pve1/lxc/1000/config" || labels["state"] != "ready" || labels[ProxmoxLXCGenerationLabel] == "" {
-		t.Fatalf("method=%s path=%s labels=%v", method, path, labels)
+func TestProxmoxLXCSetLabelsUsesContainerConfigPutAndKeepsGeneration(t *testing.T) {
+	generation := strings.Repeat("ab", 16)
+	for name, tc := range map[string]struct {
+		labels  map[string]string
+		wantErr bool
+	}{
+		"same generation":                        {labels: map[string]string{"state": "ready", ProxmoxLXCGenerationLabel: generation}},
+		"generation omitted by a partial writer": {labels: map[string]string{"state": "ready"}},
+		"different generation":                   {labels: map[string]string{"state": "ready", ProxmoxLXCGenerationLabel: strings.Repeat("cd", 16)}, wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var method, path string
+			var form url.Values
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/lxc/1000/config" {
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"description": "crabbox labels\nlease=cbx_123456abcdef\n" + ProxmoxLXCGenerationLabel + "=" + generation + "\n"}})
+					return
+				}
+				method, path, form = r.Method, r.URL.Path, readForm(t, r)
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": nil})
+			}))
+			defer server.Close()
+			client, err := NewProxmoxClient(proxmoxLXCTestConfig(server.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.SetLabelsOnNode(context.Background(), "pve1", "1000", tc.labels)
+			if tc.wantErr {
+				if err == nil || method != "" {
+					t.Fatalf("a foreign generation was written: err=%v method=%s", err, method)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			labels := proxmoxDescriptionLabels(form.Get("description"))
+			if method != http.MethodPut || path != "/api2/json/nodes/pve1/lxc/1000/config" || labels["state"] != "ready" || labels[ProxmoxLXCGenerationLabel] != generation {
+				t.Fatalf("method=%s path=%s labels=%v", method, path, labels)
+			}
+		})
 	}
 }

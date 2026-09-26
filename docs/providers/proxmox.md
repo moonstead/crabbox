@@ -358,11 +358,15 @@ For each lease, Crabbox:
    `vztmpl` volume, `unprivileged=1`, exactly the configured cores, memory,
    swap and root disk on `storage`, one DHCP `eth0` on `bridge`, `onboot=0`,
    the pool, and the per-lease SSH public key. The request names no feature
-   flag, mount point, device, hookscript or raw LXC key.
-2. Reads the configuration back and refuses the container if any other key is
-   present, it is not unprivileged, or a resource, disk or network value
-   differs. A refused container is deleted, or kept in fixed custody for
-   checked release.
+   flag, mount point, device, hookscript or raw LXC key. It also carries no
+   tag: Proxmox checks tags against `/vms/<vmid>` without the pool ACL, so a
+   pool-scoped token may set `tags=crabbox` only in a configuration update
+   after the container has joined the pool, which is the next step.
+2. Applies `tags=crabbox` with `PUT /nodes/<node>/lxc/<vmid>/config`, then
+   reads the configuration back and refuses the container if any other key is
+   present, it is not unprivileged, the tag is missing, or a resource, disk or
+   network value differs. A refused container is deleted, or kept in fixed
+   custody for checked release.
 3. Starts it and reads eth0's IPv4 address from
    `/nodes/<node>/lxc/<vmid>/interfaces`. There is no guest agent.
 4. Connects once as `root`, because Proxmox installs a create-time key only
@@ -380,10 +384,17 @@ user namespace, AppArmor profile and seccomp filter.
 LXC has no `vmgenid`. Each container instead gets a random 128-bit
 `lxc_generation` label at creation. A fixed lease binds that value exactly as
 it binds `vmgenid` for QEMU, before the configuration audit, so a refused
-container stays in custody for checked release. Release stops and deletes the
-container with `purge=1` and `destroy-unreferenced-disks=1`, then proves
-absence the same way. Prepared-claim recovery fences on active `vzcreate`
-tasks instead of `qmclone`.
+container stays in custody for checked release. The label lives in the
+container description, which every label update replaces, so each update
+first reads the current generation back: an update that omits it keeps it,
+and an update that names another generation is refused. Release stops the
+container only when Proxmox reports it `running`, because Proxmox refuses to
+stop a stopped container; a `stopped` container, such as one refused before
+its first start or one that exited on its own, is deleted directly, and any
+other state fails closed. Deletion uses `purge=1` and
+`destroy-unreferenced-disks=1`, then proves absence the same way as QEMU.
+Prepared-claim recovery fences on active `vzcreate` tasks instead of
+`qmclone`.
 
 The template must be an unprivileged-compatible root filesystem with
 `openssh-server`, `sudo`, `git`, `rsync`, `curl` and `jq`, SSH enabled as
@@ -411,8 +422,9 @@ bridge     configured bridge or the template net0 bridge is active
 template   /nodes/<node>/qemu and /config show templateId is a QEMU template
            (guest=lxc: the lxcTemplate volume is listed as vztmpl content)
 lxc_permissions
-           guest=lxc only: the pool or /vms, root-disk storage and template
-           storage grant every privilege the container lifecycle needs
+           guest=lxc only: the pool or /vms, root-disk storage, template
+           storage, the bridge's SDN zone and the node grant every privilege
+           the container lifecycle and prepared-claim recovery need
 nextid     /cluster/nextid is readable
 pool       configured /pools/<pool> is readable, when set
 inventory  /vms has propagated VM.Audit and cluster inventory is readable
@@ -442,9 +454,13 @@ for lease lifecycle operations:
 A `guest: lxc` lease needs, on its pool or on `/vms` without a pool,
 `VM.Allocate`, `VM.Audit`, `VM.Config.CPU`, `VM.Config.Disk`,
 `VM.Config.Memory`, `VM.Config.Network`, `VM.Config.Options` and
-`VM.PowerMgmt`. It also needs `Datastore.AllocateSpace` on the root-disk
-storage, `Datastore.Audit` or `Datastore.AllocateSpace` on the template's
-storage, and `SDN.Use` on the bridge. It needs no template VM grant.
+`VM.PowerMgmt`. `VM.Config.Options` also covers the `crabbox` tag, because
+the tag is applied after the container joins the pool. It also needs
+`Datastore.AllocateSpace` on the root-disk storage, `Datastore.Audit` or
+`Datastore.AllocateSpace` on the template's storage, `SDN.Use` on
+`/sdn/zones/localnetwork/<bridge>`, and `Sys.Audit` on `/nodes/<node>` for
+prepared-claim recovery. It needs no template VM grant. Doctor's
+`lxc_permissions` check names every missing privilege.
 
 The exact least-privilege role depends on the Proxmox VE version and local ACL
 model. If doctor fails with `class=permission`, fix the named endpoint first and

@@ -1250,6 +1250,9 @@ func (c *ProxmoxClient) startVM(ctx context.Context, vmid int) error {
 }
 
 func (c *ProxmoxClient) stopVM(ctx context.Context, vmid int) error {
+	if c.guestType() == ProxmoxGuestLXC {
+		return c.lxcStopIfRunning(ctx, vmid)
+	}
 	var upid string
 	if err := c.do(ctx, http.MethodPost, c.guestPath(vmid)+"/status/stop", url.Values{}, &upid); err != nil {
 		if IsProxmoxNotFound(err) {
@@ -1438,6 +1441,13 @@ func (c *ProxmoxClient) SetLabels(ctx context.Context, id string, labels map[str
 			return err
 		}
 		vmid = int(server.ID)
+	}
+	if c.guestType() == ProxmoxGuestLXC {
+		preserved, err := c.lxcPreserveGeneration(ctx, vmid, labels)
+		if err != nil {
+			return err
+		}
+		labels = preserved
 	}
 	return c.configureVM(ctx, vmid, url.Values{"description": {proxmoxDescription(labels)}})
 }

@@ -37,6 +37,7 @@ const (
 	ProxmoxLXCGenerationLabel = "lxc_generation"
 
 	proxmoxLXCBootstrapUser = "root"
+	proxmoxLeaseTag         = "crabbox"
 	proxmoxLXCMaxCores      = 64
 	proxmoxLXCMinMemoryMiB  = 512
 	proxmoxLXCMaxMemoryMiB  = 262144
@@ -209,6 +210,12 @@ func (c *ProxmoxClient) createLXCServer(ctx context.Context, cfg Config, publicK
 			return Server{}, err
 		}
 	}
+	// Proxmox checks tags against /vms/<vmid> alone, without the pool, so a
+	// pool-scoped token may set them only once the container is a pool member.
+	if err := c.configureVM(ctx, vmid, url.Values{"tags": {proxmoxLeaseTag}}); err != nil {
+		cleanup()
+		return Server{}, err
+	}
 	// Audit after binding so a refused container stays in fixed custody and
 	// ordinary checked release can delete it.
 	if err := c.auditLXCConfig(ctx, vmid, cfg, name); err != nil {
@@ -238,7 +245,9 @@ func (c *ProxmoxClient) createLXCServer(ctx context.Context, cfg Config, publicK
 
 // proxmoxLXCCreateForm is the complete create request. It names no feature,
 // mount point, device, hookscript or raw LXC key, so the container gets
-// Proxmox's default unprivileged AppArmor and seccomp confinement.
+// Proxmox's default unprivileged AppArmor and seccomp confinement. Tags are
+// not part of it: Proxmox checks them without the pool ACL, so they follow
+// in a configuration update once the container belongs to the pool.
 func proxmoxLXCCreateForm(cfg Config, vmid int, name, publicKey string, labels map[string]string) url.Values {
 	p := cfg.Proxmox
 	form := url.Values{
@@ -246,7 +255,6 @@ func proxmoxLXCCreateForm(cfg Config, vmid int, name, publicKey string, labels m
 		"ostemplate":      {strings.TrimSpace(p.LXCTemplate)},
 		"hostname":        {name},
 		"description":     {proxmoxDescription(labels)},
-		"tags":            {"crabbox"},
 		"unprivileged":    {"1"},
 		"ssh-public-keys": {publicKey},
 		"rootfs":          {fmt.Sprintf("%s:%d", strings.TrimSpace(p.Storage), p.LXCDiskGiB)},
@@ -295,6 +303,9 @@ func proxmoxLXCConfigProblem(config map[string]any, cfg Config, name string) err
 	}
 	if proxmoxConfigString(config["unprivileged"]) != "1" {
 		return refuse("container is not unprivileged")
+	}
+	if proxmoxConfigString(config["tags"]) != proxmoxLeaseTag {
+		return refuse("tags differ from the request")
 	}
 	p := cfg.Proxmox
 	for key, want := range map[string]string{
@@ -509,6 +520,8 @@ func (c *ProxmoxClient) proxmoxLXCTemplateCheck(ctx context.Context, cfg Config)
 
 // proxmoxLXCPrivileges are what creating, starting, inspecting and deleting
 // a bounded container needs on its pool, or on /vms without a pool.
+// VM.Config.Options also covers the crabbox tag, which is applied after the
+// container has joined the pool.
 var proxmoxLXCPrivileges = []string{
 	"VM.Allocate", "VM.Audit", "VM.Config.CPU", "VM.Config.Disk", "VM.Config.Memory",
 	"VM.Config.Network", "VM.Config.Options", "VM.PowerMgmt",
@@ -523,6 +536,7 @@ func (c *ProxmoxClient) proxmoxLXCPermissionCheck(ctx context.Context, cfg Confi
 	}
 	storage := strings.TrimSpace(cfg.Proxmox.Storage)
 	templateStorage, _, _ := strings.Cut(strings.TrimSpace(cfg.Proxmox.LXCTemplate), ":")
+	bridge := strings.TrimSpace(cfg.Proxmox.Bridge)
 	required := []struct {
 		path  string
 		privs []string
@@ -531,6 +545,10 @@ func (c *ProxmoxClient) proxmoxLXCPermissionCheck(ctx context.Context, cfg Confi
 		{path: scope, privs: proxmoxLXCPrivileges},
 		{path: "/storage/" + storage, privs: []string{"Datastore.AllocateSpace"}},
 		{path: "/storage/" + templateStorage, privs: []string{"Datastore.AllocateSpace", "Datastore.Audit"}, any: true},
+		// Attaching net0 to a plain bridge is checked on its local SDN zone.
+		{path: "/sdn/zones/localnetwork/" + bridge, privs: []string{"SDN.Use"}},
+		// Prepared-claim recovery inspects the node's active vzcreate tasks.
+		{path: "/nodes/" + strings.TrimSpace(cfg.Proxmox.Node), privs: []string{"Sys.Audit"}},
 	}
 	var missing []string
 	for _, requirement := range required {
@@ -582,4 +600,60 @@ func proxmoxLXCStorageCheck(cfg Config, storages []proxmoxStorage, endpoint stri
 	check.Details["source"] = "configured"
 	check.Details["templateStorages"] = templateStorage
 	return check
+}
+
+// lxcStopIfRunning stops a container only when Proxmox reports it running.
+// Proxmox refuses to stop a stopped container, so a refused container that
+// never started, or one that exited on its own, would otherwise never pass
+// checked release. Any other state fails closed.
+func (c *ProxmoxClient) lxcStopIfRunning(ctx context.Context, vmid int) error {
+	var status proxmoxVM
+	if err := c.doRequired(ctx, http.MethodGet, c.guestPath(vmid)+"/status/current", nil, &status); err != nil {
+		return err
+	}
+	switch status.Status {
+	case "stopped":
+		return nil
+	case "running":
+		var upid string
+		if err := c.do(ctx, http.MethodPost, c.guestPath(vmid)+"/status/stop", url.Values{}, &upid); err != nil {
+			if IsProxmoxNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		return c.waitTask(ctx, upid)
+	default:
+		return fmt.Errorf("proxmox container %d is in state %q; refusing to stop or delete it", vmid, status.Status)
+	}
+}
+
+// lxcPreserveGeneration keeps the generation label a container was created
+// with. The label lives in the description, which every label write
+// replaces, so a writer that omits it would erase the container's identity.
+// A different generation is refused.
+func (c *ProxmoxClient) lxcPreserveGeneration(ctx context.Context, vmid int, labels map[string]string) (map[string]string, error) {
+	var config map[string]any
+	if err := c.doRequired(ctx, http.MethodGet, c.guestPath(vmid)+"/config", nil, &config); err != nil {
+		return nil, err
+	}
+	current := ""
+	if desc, ok := config["description"].(string); ok {
+		current = proxmoxLXCGenerationID(proxmoxDescriptionLabels(desc)[ProxmoxLXCGenerationLabel])
+	}
+	if current == "" {
+		return labels, nil
+	}
+	merged := maps.Clone(labels)
+	if merged == nil {
+		merged = map[string]string{}
+	}
+	switch merged[ProxmoxLXCGenerationLabel] {
+	case "":
+		merged[ProxmoxLXCGenerationLabel] = current
+	case current:
+	default:
+		return nil, fmt.Errorf("proxmox container %d generation label does not match the container", vmid)
+	}
+	return merged, nil
 }
