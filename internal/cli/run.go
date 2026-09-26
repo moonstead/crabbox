@@ -5247,7 +5247,11 @@ func confirmedAbsentLocalStateSnapshot(ctx context.Context, backend Backend, exp
 			if !ok {
 				return confirmedAbsentLocalState{}, Exit(4, "lease claim provider changed before confirmed-absence cleanup")
 			}
-			if expected.LeaseID == "" || expected.AttemptLeaseID == "" || expected.Slug == "" || expected.ResourceID == "" || providerScope == "" {
+			// An adapter that never acknowledged a provider identity has only its
+			// attempt and slug. Its provider decides whether a receipt can match.
+			unacknowledged := expected.LeaseID == "" && expected.ResourceID == ""
+			if expected.AttemptLeaseID == "" || expected.Slug == "" || providerScope == "" ||
+				!unacknowledged && (expected.LeaseID == "" || expected.ResourceID == "") {
 				return confirmedAbsentLocalState{}, Exit(4, "terminal receipt cleanup requires complete provider identity and scope")
 			}
 			if err := retainer.ValidateConfirmedAbsentTerminalReceipt(cloneLeaseClaim(claim), ConfirmedAbsentLocalCleanupRequest{ExpectedProviderIdentity: expected, ProviderScope: providerScope}); err != nil {

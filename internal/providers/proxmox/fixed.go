@@ -438,6 +438,11 @@ func validateFixedProxmoxTerminalClaim(claim core.LeaseClaim) error {
 // while the released claim stays as the lease ID's receipt. The request carries
 // the controller scope, which differs from the claim scope, so both are checked
 // against the current configuration. It is local and read-only.
+//
+// An adapter that never acknowledged a provider identity, for example because
+// an operator released the attempt first, knows only its attempt ID and slug.
+// Only a released receipt for exactly that attempt, slug and scope, never
+// registered with a coordinator, then matches.
 func (b *leaseBackend) ValidateConfirmedAbsentTerminalReceipt(claim core.LeaseClaim, req core.ConfirmedAbsentLocalCleanupRequest) error {
 	expected := req.ExpectedProviderIdentity
 	controllerScope, err := (Provider{}).ControllerProviderScope(b.Cfg)
@@ -445,18 +450,23 @@ func (b *leaseBackend) ValidateConfirmedAbsentTerminalReceipt(claim core.LeaseCl
 		return err
 	}
 	claimScope := strings.TrimSpace(core.ProviderClaimScope("proxmox", b.Cfg))
-	if expected.LeaseID == "" || expected.AttemptLeaseID == "" || expected.Slug == "" || expected.ResourceID == "" ||
+	unacknowledged := expected.LeaseID == "" && expected.ResourceID == ""
+	if expected.AttemptLeaseID == "" || expected.Slug == "" || !unacknowledged && (expected.LeaseID == "" || expected.ResourceID == "") ||
 		req.ProviderScope != controllerScope || claimScope == "" || claim.ProviderScope != claimScope {
 		return core.Exit(4, "Proxmox terminal receipt requires complete matching identity and scope")
 	}
 	if err := core.ValidateProviderIdentityExpectation(expected); err != nil {
 		return err
 	}
-	if err := fixedProxmoxLeaseKind.ValidateTerminalClaim(claim, core.LeaseClaim{}, expected.LeaseID, validateFixedProxmoxTerminalClaim); err != nil {
+	if err := fixedProxmoxLeaseKind.ValidateTerminalClaim(claim, core.LeaseClaim{}, expected.AttemptLeaseID, validateFixedProxmoxTerminalClaim); err != nil {
 		return err
 	}
-	if claim.LeaseID != expected.AttemptLeaseID || claim.Slug != expected.Slug || claim.CloudID != expected.ResourceID {
+	if claim.LeaseID != expected.AttemptLeaseID || claim.Slug != expected.Slug ||
+		!unacknowledged && (claim.LeaseID != expected.LeaseID || claim.CloudID != expected.ResourceID) {
 		return core.Exit(4, "Proxmox terminal receipt identity changed")
+	}
+	if unacknowledged && (claim.RuntimeAdapterRegistrationID != "" || claim.RuntimeAdapterPendingRegistrationID != "") {
+		return core.Exit(4, "Proxmox terminal receipt was registered with a coordinator the adapter never acknowledged")
 	}
 	return nil
 }
