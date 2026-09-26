@@ -406,11 +406,17 @@ upgrades return to the exact same-origin requirement.
 Every portal page answers with `frame-ancestors 'none'`. Only the embedded
 WebVNC viewer under `/vnc/embed` may be framed, only by the single origin in
 `CRABBOX_WEBVNC_EMBED_ORIGIN`, and only through a ticket minted with
-`embed: true`. Its session cookie is `SameSite=None; Partitioned`, so it exists
-only inside that embedding site and never reaches a top-level portal
-navigation. The frame posts status words to that origin and nothing else; the
-embedding page cannot read the cookie, the desktop credentials, the frame's
-history or call the session's own routes from its origin.
+`embed: true`. Its session cookie `crabbox_webvnc_embed_session` is
+`SameSite=None; Partitioned` with an explicit `Max-Age`, lives on the
+`/vnc/embed` path and is read only by the embed routes, while the portal
+viewer's `crabbox_webvnc_session` stays `SameSite=Strict` on `/vnc` and is
+read only by the portal routes. When the embedding site and the coordinator
+are same-site a browser sends both cookies to both places; the separate names,
+paths and readers keep each session bound to its own viewer. Every
+embed-visible failure is a frameable notice, so no embed response redirects
+to the portal login. The frame posts status words to that origin and nothing
+else; the embedding page cannot read the cookie, the desktop credentials, the
+frame's history or call the session's own routes from its origin.
 Portal logout follows the same boundary: `GET /portal/logout` only renders a
 confirmation page, and only a same-origin `POST` clears the portal cookie and
 revokes all WebVNC, Code, and mediated-egress bridges bound to that portal

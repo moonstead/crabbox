@@ -35,3 +35,33 @@ export function webVNCEmbedFrameAncestors(env: Pick<Env, "CRABBOX_WEBVNC_EMBED_O
 }
 
 export const webVNCEmbedMessageType = "crabbox-webvnc-embed";
+
+/**
+ * The embed contract version. The mint response echoes it as `embedContract`
+ * and every status message carries it as `contract`, so an embedding
+ * application can require the contract it was written against before it
+ * posts a ticket into a frame.
+ */
+export const webVNCEmbedContract = "crabbox-webvnc-embed/1";
+
+/** Cookie name of an embed viewer session; distinct from the portal viewer cookie. */
+export const webVNCEmbedSessionCookieName = "crabbox_webvnc_embed_session";
+
+/** Cookie name of a portal viewer session. */
+export const webVNCPortalSessionCookieName = "crabbox_webvnc_session";
+
+/**
+ * Query marker the embed bootstrap adds to the viewer URL it navigates to.
+ * When the viewer page then arrives without any embed cookie, the browser
+ * refused to store a partitioned cross-site cookie, and the frame reports
+ * `external-open-required` once instead of asking for another ticket.
+ */
+export const webVNCEmbedBootstrappedMarker = "bootstrapped";
+
+/** Status words an embed frame may post to its embedding origin. */
+export type WebVNCEmbedState =
+  | "session-required"
+  | "external-open-required"
+  | "unavailable"
+  | "connected"
+  | "disconnected";

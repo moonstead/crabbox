@@ -348,6 +348,66 @@ describe("coordinator auth", () => {
       });
     }
 
+    // Embed session routes admit only the embed cookie; portal session routes
+    // admit only the portal cookie. Each cookie is inert on the other side.
+    const embedCookie =
+      "crabbox_webvnc_embed_session=webvnc_session_0123456789abcdef0123456789abcdef";
+    const embedBase = "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed";
+    const embedRoutes = await Promise.all(
+      [`${embedBase}/status`, `${embedBase}/viewer`, `${embedBase}/handoff`, embedBase].map(
+        async (url) => ({
+          url,
+          prepared: await prepareCoordinatorRequest(
+            new Request(url, {
+              headers: { cookie: embedCookie, "x-crabbox-owner": "forged@example.test" },
+            }),
+            env,
+          ),
+        }),
+      ),
+    );
+    for (const { url, prepared } of embedRoutes) {
+      expect({ url, prepared }).toMatchObject({ url, prepared: { authenticated: false } });
+      if ("response" in prepared) {
+        throw new Error(`embed session route ${url} did not reach the coordinator`);
+      }
+      expect(prepared.request.headers.has("x-crabbox-owner")).toBe(false);
+    }
+    const crossed = await Promise.all(
+      [
+        [`${embedBase}/status`, sessionCookie],
+        [`${embedBase}/viewer`, sessionCookie],
+        ["https://broker.example.test/portal/leases/cbx_000000000001/vnc/status", embedCookie],
+        ["https://broker.example.test/portal/leases/cbx_000000000001/vnc", embedCookie],
+        [
+          "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed/status/x",
+          embedCookie,
+        ],
+      ].map(async ([url, cookie]) => ({
+        url,
+        prepared: await prepareCoordinatorRequest(
+          new Request(url as string, { headers: { cookie: cookie as string } }),
+          env,
+        ),
+      })),
+    );
+    for (const { url, prepared } of crossed) {
+      expect({ url, prepared }).toMatchObject({
+        url,
+        prepared: { authenticated: false, response: { status: 302 } },
+      });
+    }
+    // A cookie-bearing mutation from the embedding origin stays behind the
+    // same-origin gate on the embed routes too.
+    const foreignTheme = await prepareCoordinatorRequest(
+      new Request(`${embedBase}/theme`, {
+        method: "POST",
+        headers: { cookie: embedCookie, origin: "https://bb.example.test" },
+      }),
+      env,
+    );
+    expect(foreignTheme).toMatchObject({ authenticated: false, response: { status: 403 } });
+
     const page = await prepareCoordinatorRequest(
       new Request("https://broker.example.test/portal/leases/cbx_000000000001/vnc", {
         headers: { cookie: `crabbox_session=existing-github-session; ${sessionCookie}` },

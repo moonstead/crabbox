@@ -8,7 +8,12 @@ import type {
   RunRecord,
 } from "./types";
 import { coordinatorProviderSpec } from "./types";
-import { webVNCEmbedMessageType } from "./webvnc-embed";
+import {
+  webVNCEmbedBootstrappedMarker,
+  webVNCEmbedContract,
+  webVNCEmbedMessageType,
+  type WebVNCEmbedState,
+} from "./webvnc-embed";
 
 const novncModuleURL = "/portal/assets/novnc/rfb.js";
 const copyIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>`;
@@ -1053,11 +1058,14 @@ export function portalVNC(
   const target = lease.target || "linux";
   const embed = options.embed;
   const title = embed ? "Desktop" : `WebVNC ${slug}`;
-  const wsPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/viewer`;
-  const statusPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/status`;
-  const controlPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/control`;
-  const themePath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/theme`;
-  const handoffPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/handoff`;
+  // Embed sessions call their own routes under `/vnc/embed`, where only the
+  // embed session cookie is read.
+  const routeBase = `/portal/leases/${encodeURIComponent(lease.id)}/vnc${embed ? "/embed" : ""}`;
+  const wsPath = `${routeBase}/viewer`;
+  const statusPath = `${routeBase}/status`;
+  const controlPath = `${routeBase}/control`;
+  const themePath = `${routeBase}/theme`;
+  const handoffPath = `${routeBase}/handoff`;
   const sharePath = `/portal/leases/${encodeURIComponent(lease.id)}/share`;
   const shareAPIPath = `${sharePath}?format=json`;
   const canManage = options.canManage === true;
@@ -1084,9 +1092,36 @@ export function portalVNC(
         },
       };
   const bridgeCmd = canManage ? webVNCBridgeCommand(lease) : "";
-  const bridgeMissingMessage = canManage
-    ? "WebVNC daemon not running; run the bridge command below"
-    : "WebVNC daemon not running; ask a lease manager to start or refresh the bridge";
+  const bridgeMissingMessage = embed
+    ? "Desktop is not running; ask its owner to start it"
+    : canManage
+      ? "WebVNC daemon not running; run the bridge command below"
+      : "WebVNC daemon not running; ask a lease manager to start or refresh the bridge";
+  // Wording the viewer shows and reports. The embed surface carries no
+  // product name and no CLI hint.
+  const words = embed
+    ? {
+        bridgeUnavailable: "Desktop unavailable",
+        statusUnavailable: "Desktop status unavailable",
+        observerSlot: "waiting for an available desktop viewer slot",
+        missingCredentials: "Desktop credentials missing; reopen the desktop",
+        failedCredentials: "Desktop sign-in failed; reopen the desktop",
+        authTimeout: "Desktop sign-in timed out; reopen the desktop",
+        requestCancelled: "Desktop request cancelled",
+        requestTimeout: "Desktop request timed out; try again",
+        sessionExpired: "Desktop session ended",
+      }
+    : {
+        bridgeUnavailable: "WebVNC bridge unavailable",
+        statusUnavailable: "WebVNC status unavailable",
+        observerSlot: "waiting for an available WebVNC observer slot",
+        missingCredentials: "VNC credentials missing; open WebVNC from crabbox webvnc status",
+        failedCredentials: "VNC authentication failed; reopen WebVNC from crabbox webvnc status",
+        authTimeout: "VNC authentication timed out; reopen WebVNC from crabbox webvnc status",
+        requestCancelled: "WebVNC collaboration request cancelled",
+        requestTimeout: "WebVNC collaboration request timed out; try again",
+        sessionExpired: "Desktop session expired",
+      };
   const fullscreenIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5"/><path d="M20 9V4h-5"/><path d="M4 15v5h5"/><path d="M20 15v5h-5"/></svg>`;
   const reconnectIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>`;
   const pasteIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2h6a2 2 0 0 1 2 2v1H7V4a2 2 0 0 1 2-2Z"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11v6"/><path d="m9 14 3 3 3-3"/></svg>`;
@@ -1119,7 +1154,7 @@ export function portalVNC(
       ${header}
       <div class="vnc-display">
         <p id="vnc-sizing-notice" class="vnc-sizing-notice" role="status" hidden>Wayland sizing may remain owned by the previous viewer. Close that viewer, then reconnect.</p>
-        <section id="screen" class="screen" aria-label="WebVNC display" tabindex="0"></section>
+        <section id="screen" class="screen" aria-label="${embed ? "Desktop display" : "WebVNC display"}" tabindex="0"></section>
       </div>
       ${
         canManage
@@ -1218,20 +1253,27 @@ export function portalVNC(
       const embedMode = ${JSON.stringify(Boolean(embed))};
       const embedOrigin = ${JSON.stringify(embed?.origin ?? "")};
       const embedMessageType = ${JSON.stringify(webVNCEmbedMessageType)};
+      const embedContract = ${JSON.stringify(webVNCEmbedContract)};
+      const words = ${JSON.stringify(words)};
+      // Server-supplied detail is shown only in the portal; the embed surface
+      // keeps its own neutral wording.
+      function detail(message, fallback) {
+        return (!embedMode && message) || fallback;
+      }
       // Status only: the embedding page never receives credentials, tickets,
       // session values or URLs, and only the configured origin can receive it.
       function notifyEmbedHost(state, message = "") {
         if (!embedMode || !embedOrigin || window.parent === window) return;
         try {
-          window.parent.postMessage({ type: embedMessageType, leaseID: ${JSON.stringify(lease.id)}, state, message: String(message || "") }, embedOrigin);
+          window.parent.postMessage({ type: embedMessageType, contract: embedContract, leaseID: ${JSON.stringify(lease.id)}, state, message: String(message || "") }, embedOrigin);
         } catch (_) {}
       }
       const reuseWindowName = "crabbox-webvnc-" + ${JSON.stringify(lease.id)};
       const reuseChannel = typeof BroadcastChannel === "function" ? new BroadcastChannel(reuseWindowName) : null;
       let portalReadyForReuse = false;
       const bridgeMissingMessage = ${JSON.stringify(bridgeMissingMessage)};
-      const missingVNCCredentialMessage = "VNC credentials missing; open WebVNC from crabbox webvnc status";
-      const failedVNCCredentialMessage = "VNC authentication failed; reopen WebVNC from crabbox webvnc status";
+      const missingVNCCredentialMessage = words.missingCredentials;
+      const failedVNCCredentialMessage = words.failedCredentials;
       function rfbOptions() {
         const credentials = {};
         if (username) credentials.username = username;
@@ -1246,7 +1288,14 @@ export function portalVNC(
           body: JSON.stringify(handoffTicket ? { ticket: handoffTicket } : {}),
         });
         const body = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(body.message || body.error || "VNC handoff failed");
+        if (!response.ok) {
+          const error = new Error(detail(body.message || body.error, embedMode ? words.sessionExpired : "VNC handoff failed"));
+          // The one-use credentials were already consumed by an earlier
+          // navigation of this session (a remounted or second frame). No
+          // retry can recover them; the embedding origin must mint again.
+          if (embedMode && response.status === 401) error.sessionRequired = true;
+          throw error;
+        }
         username = typeof body.username === "string" ? body.username : "";
         password = typeof body.password === "string" ? body.password : "";
         credentialsReady = true;
@@ -1473,10 +1522,10 @@ export function portalVNC(
         try {
           const result = await operation(controller.signal);
           // A JSON fallback must not convert a cancelled takeover into success.
-          if (controller.signal.aborted) throw new Error("WebVNC collaboration request cancelled");
+          if (controller.signal.aborted) throw new Error(words.requestCancelled);
           return result;
         } catch (error) {
-          if (timedOut) throw new Error("WebVNC collaboration request timed out; try again");
+          if (timedOut) throw new Error(words.requestTimeout);
           throw error;
         } finally {
           window.clearTimeout(timer);
@@ -1513,9 +1562,9 @@ export function portalVNC(
             if (response.ok) {
               return await response.json();
             }
-            const message = await responseMessage(response, "WebVNC bridge unavailable");
+            const message = detail(await responseMessage(response, ""), words.bridgeUnavailable);
             if (embedMode && response.status === 401) {
-              return { terminal: true, sessionRequired: true, message: "Desktop session expired" };
+              return { terminal: true, sessionRequired: true, message: words.sessionExpired };
             }
             if (terminalStatusCodes.has(response.status)) {
               return { terminal: true, message };
@@ -1678,20 +1727,21 @@ export function portalVNC(
           if (!current()) return;
           if (state?.controllerID) controllerID = state.controllerID;
           if (state?.terminal) {
-            stopPolling(state.message || "WebVNC bridge unavailable");
-            notifyEmbedHost(state.sessionRequired ? "session-required" : "unavailable", state.message);
+            const terminalMessage = state.sessionRequired ? words.sessionExpired : detail(state.message, words.bridgeUnavailable);
+            stopPolling(terminalMessage);
+            notifyEmbedHost(state.sessionRequired ? "session-required" : "unavailable", terminalMessage);
             return;
           }
           if (state?.transient) {
-            scheduleRetry(state.message || "WebVNC status unavailable");
+            scheduleRetry(detail(state.message, words.statusUnavailable));
             return;
           }
           if (state && !state.bridgeConnected) {
-            scheduleRetry(state.message || bridgeMissingMessage);
+            scheduleRetry(detail(state.message, bridgeMissingMessage));
             return;
           }
           if (state && state.availableViewerSlots === 0) {
-            scheduleRetry(state.message || "waiting for an available WebVNC observer slot");
+            scheduleRetry(detail(state.message, words.observerSlot));
             return;
           }
           setStatus(retryAttempt ? "bridge connected; opening viewer" : "connecting");
@@ -1738,7 +1788,7 @@ export function portalVNC(
             retireConnection();
             if (wasConnected) notifyEmbedHost("disconnected");
             if (!wasConnected && (authenticationFailed || credentialsSent)) {
-              stopPolling(authenticationFailed ? failedVNCCredentialMessage : "VNC authentication timed out; reopen WebVNC from crabbox webvnc status");
+              stopPolling(authenticationFailed ? failedVNCCredentialMessage : words.authTimeout);
               return;
             }
             scheduleRetry(wasConnected ? "VNC bridge disconnected" : "waiting for VNC bridge");
@@ -1777,6 +1827,11 @@ export function portalVNC(
           });
         } catch (error) {
           if (!current()) return;
+          if (embedMode && error?.sessionRequired) {
+            stopPolling(words.sessionExpired);
+            notifyEmbedHost("session-required", words.sessionExpired);
+            return;
+          }
           scheduleRetry(error instanceof Error ? error.message : String(error));
         }
       }
@@ -2130,7 +2185,15 @@ export function portalVNC(
           window.close();
           return;
         }
-        if (!embedMode) {
+        if (embedMode) {
+          // Drop the bootstrap marker so a later reload with an expired
+          // cookie reads as session-required, not as a cookie refusal.
+          const cleanURL = new URL(window.location.href);
+          if (cleanURL.searchParams.has(${JSON.stringify(webVNCEmbedBootstrappedMarker)})) {
+            cleanURL.searchParams.delete(${JSON.stringify(webVNCEmbedBootstrappedMarker)});
+            window.history.replaceState(window.history.state, "", cleanURL);
+          }
+        } else {
           window.name = reuseWindowName;
           portalReadyForReuse = true;
         }
@@ -2149,23 +2212,35 @@ export function portalVNC(
  * tells the embedding origin why, so it can mint a fresh one-use ticket, and
  * carries no credential, ticket, session or portal link.
  */
+const webVNCEmbedNoticeMessages: Record<
+  Exclude<WebVNCEmbedState, "connected" | "disconnected">,
+  { message: string; status: number }
+> = {
+  "session-required": {
+    message: "This desktop session has ended. Reopen the desktop to continue.",
+    status: 401,
+  },
+  "external-open-required": {
+    message:
+      "This browser does not keep the desktop session inside an embedded frame. Open the desktop in a new tab.",
+    status: 401,
+  },
+  unavailable: { message: "This desktop is unavailable.", status: 409 },
+};
+
 export function portalVNCEmbedNotice(options: {
   leaseID: string;
-  state: "session-required" | "unavailable";
-  message?: string;
+  state: Exclude<WebVNCEmbedState, "connected" | "disconnected">;
   status?: number;
   frameAncestors: string;
   origin: string;
 }): Response {
   const nonce = scriptNonce();
-  const message =
-    options.message ||
-    (options.state === "session-required"
-      ? "This desktop session has ended. Reopen the desktop to continue."
-      : "This desktop is unavailable.");
-  const status = options.status ?? (options.state === "session-required" ? 401 : 409);
+  const { message } = webVNCEmbedNoticeMessages[options.state];
+  const status = options.status ?? webVNCEmbedNoticeMessages[options.state].status;
   const payload = {
     type: webVNCEmbedMessageType,
+    contract: webVNCEmbedContract,
     leaseID: options.leaseID,
     state: options.state,
     message,

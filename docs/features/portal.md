@@ -132,41 +132,66 @@ The contract is the ticket flow above with `embed: true`:
 
 1. `POST /v1/leases/{id}/webvnc/viewer-bootstrap` with a bearer token and a
    JSON body `{"credentialHandoffTicket": "...", "embed": true,
-   "takeControl": true}` returns `{ticket, leaseID, expiresAt, embed: true}`.
-   The ticket is one-use, expires after 120 seconds and is redeemable only at
-   the embed bootstrap. When embed mode is off the request fails with
+   "takeControl": true}` returns `{ticket, leaseID, expiresAt, embed: true,
+   embedContract: "crabbox-webvnc-embed/1"}`. The application should require
+   that `embedContract` value before it posts the ticket into a frame: an
+   older coordinator ignores `embed` and returns neither field. The ticket is
+   one-use, expires after 120 seconds and is redeemable only at the embed
+   bootstrap. When embed mode is off the request fails with
    `409 webvnc_embed_unavailable` and no ticket is stored.
 2. The application's page submits a form with a single field `ticket` to
    `POST /portal/leases/{id}/vnc/embed/bootstrap`, targeting an `iframe` that
    it owns. The ticket travels only in that POST body. The response consumes
-   the ticket, sets a `crabbox_webvnc_session` cookie with `HttpOnly; Secure;
-   SameSite=None; Partitioned` on the lease's `/vnc` path, and replaces the
-   frame's location with `GET /portal/leases/{id}/vnc/embed`. Any ticket
-   presented at the wrong bootstrap is rejected and burned.
+   the ticket, sets a `crabbox_webvnc_embed_session` cookie with `HttpOnly;
+   Secure; SameSite=None; Partitioned; Max-Age=<remaining session seconds>`
+   on the lease's `/vnc/embed` path, and replaces the frame's location with
+   `GET /portal/leases/{id}/vnc/embed?bootstrapped=1`. Any ticket presented at
+   the wrong bootstrap is rejected and burned. The cookie name and path are
+   distinct from the portal viewer's `crabbox_webvnc_session` on `/vnc`, so an
+   inline frame and a portal tab for the same lease can coexist in one
+   browser, including when the embedding site and the coordinator are
+   same-site and both cookies travel together.
 3. The embed page renders only the noVNC display and its own controls: status,
    sizing, take control, clipboard, reconnect and fullscreen. It has no brand,
-   navigation, log out, share or bridge command and never names the lease.
-   Fullscreen inside a frame needs `allow="fullscreen"` on the `iframe`.
-   Reloading the frame reuses the same session and returns to the same desktop
-   until the session's 30-minute lifetime, the lease, the grant or the token
-   behind it ends.
+   navigation, log out, share or bridge command, never names the lease, and
+   its status wording and error messages carry no product name or CLI hint.
+   Fullscreen inside a frame needs `allow="fullscreen"` on the `iframe`. The
+   viewer talks only to `/portal/leases/{id}/vnc/embed/{status,control,theme,
+   handoff,viewer}`, which read only the embed cookie. Reloading the frame in
+   place reuses the same session and returns to the same desktop until the
+   session's 30-minute lifetime, the lease, the grant or the token behind it
+   ends.
 
-Every embed response answers with `frame-ancestors <configured origin>`; every
-portal response keeps `frame-ancestors 'none'`. The embed session opens
-nothing in the portal shell, a portal session opens nothing in the embed
-viewer, and each frame stays independent: embedded viewers never hand a
-session to another tab. Status, control, theme, handoff and the viewer
-WebSocket still require the coordinator's own origin, so the embedding page
-cannot call them, and it cannot read the cookie, the desktop credentials or
-the frame's history.
+Every embed response, success or failure, is HTML with
+`frame-ancestors <configured origin>` and a status message; the embed
+bootstrap never answers JSON. Every portal response keeps
+`frame-ancestors 'none'`, and the few JSON answers on embed session routes
+carry `frame-ancestors 'none'` too. The embed session opens nothing in the
+portal shell, a portal session opens nothing in the embed viewer, and
+embedded viewers never hand a session to another tab. Status, control,
+theme, handoff and the viewer WebSocket still require the coordinator's own
+origin, so the embedding page cannot call them, and it cannot read the
+cookie, the desktop credentials or the frame's history.
 
-The frame reports status only. When it is loaded without a valid session it
-answers `401` with a frameable notice instead of the login redirect, and the
-notice and the viewer post `{type: "crabbox-webvnc-embed", leaseID, state,
-message}` to `window.parent` with the configured origin as the only target.
-`state` is one of `session-required`, `unavailable`, `connected` and
-`disconnected`. On `session-required` the application mints a new ticket and
-repeats step 2; nothing in the message lets it do so by itself.
+The frame reports status only. The notice and the viewer post
+`{type: "crabbox-webvnc-embed", contract: "crabbox-webvnc-embed/1", leaseID,
+state, message}` to `window.parent` with the configured origin as the only
+target. `state` is one of:
+
+- `session-required`: no valid session, an expired or burned ticket at the
+  bootstrap, or a frame that cannot recover its one-use desktop credentials
+  (a frame element that was recreated, or a second frame for the same lease
+  whose bootstrap replaced the shared cookie). The frame stops, posts this
+  once and never retries; the application mints a new ticket and repeats
+  step 2. Nothing in the message lets it do so by itself.
+- `external-open-required`: the bootstrap set the cookie but the marked first
+  load of the viewer arrived without it, so this browser refuses partitioned
+  cross-site cookies. The frame posts this once; the application should open
+  the desktop in a new tab through the portal ticket flow instead of minting
+  another embed ticket.
+- `unavailable`: the lease is not active, has no desktop or is not visible;
+  also the answer to a malformed bootstrap request.
+- `connected` and `disconnected`: the viewer's VNC connection state.
 
 Take control stays inside the authenticated viewer session, through
 `takeControl` at minting and the viewer's own button. This is where later
