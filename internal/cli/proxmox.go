@@ -221,7 +221,7 @@ func (c *ProxmoxClient) DoctorReadiness(ctx context.Context, cfg Config) ([]Prox
 		c.proxmoxNetworkCheck(ctx, cfg),
 	}
 	if c.guestType() == ProxmoxGuestLXC {
-		checks = append(checks, c.proxmoxLXCTemplateCheck(ctx, cfg), c.proxmoxLXCPermissionCheck(ctx, cfg))
+		checks = append(checks, c.proxmoxLXCTemplateCheck(ctx, cfg), c.proxmoxLXCPermissionCheck(ctx, cfg), c.proxmoxLXCTagPolicyCheck(ctx))
 	} else {
 		checks = append(checks, c.proxmoxTemplateCheck(ctx, cfg))
 	}
@@ -872,6 +872,7 @@ type proxmoxClusterVM struct {
 	Node     string     `json:"node"`
 	Type     string     `json:"type"`
 	Template proxmoxInt `json:"template"`
+	Tags     string     `json:"tags"`
 }
 
 func (c *ProxmoxClient) requireVMAudit(ctx context.Context, path string) error {
@@ -1443,11 +1444,11 @@ func (c *ProxmoxClient) SetLabels(ctx context.Context, id string, labels map[str
 		vmid = int(server.ID)
 	}
 	if c.guestType() == ProxmoxGuestLXC {
-		preserved, err := c.lxcPreserveGeneration(ctx, vmid, labels)
+		form, err := c.lxcFencedLabelForm(ctx, vmid, labels)
 		if err != nil {
 			return err
 		}
-		labels = preserved
+		return c.configureVM(ctx, vmid, form)
 	}
 	return c.configureVM(ctx, vmid, url.Values{"description": {proxmoxDescription(labels)}})
 }

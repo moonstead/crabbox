@@ -9,7 +9,10 @@ import (
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
-const lxcTestTemplate = "local:vztmpl/stead-headless-lxc-2404-20260926-0123456789ab.tar.zst"
+const (
+	lxcTestTemplate   = "local:vztmpl/stead-headless-lxc-2404-20260926-0123456789ab.tar.zst"
+	lxcTestGeneration = "0123456789abcdef0123456789abcdef"
+)
 
 func lxcControllerTestConfig() core.Config {
 	cfg := controllerTestConfig()
@@ -126,6 +129,11 @@ func TestProxmoxLXCFixedLeaseCreatesReplaysAndReleasesExactContainer(t *testing.
 	}
 	if createdLabels["template_id"] != lxcTestTemplate {
 		t.Fatalf("identity labels=%v", createdLabels)
+	}
+	// This fixture exercises the fixed-claim transaction, not Proxmox HTTP:
+	// the container endpoints are covered by internal/cli's HTTP tests.
+	if first.Server.ImmutableID != lxcTestGeneration || first.Server.Labels[core.ProxmoxLXCGenerationLabel] != lxcTestGeneration {
+		t.Fatalf("fixed LXC lease is not bound to its generation label: %+v", first.Server)
 	}
 	replayed, err := backend.Acquire(context.Background(), req)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -212,7 +213,7 @@ func (c *ProxmoxClient) createLXCServer(ctx context.Context, cfg Config, publicK
 	}
 	// Proxmox checks tags against /vms/<vmid> alone, without the pool, so a
 	// pool-scoped token may set them only once the container is a pool member.
-	if err := c.configureVM(ctx, vmid, url.Values{"tags": {proxmoxLeaseTag}}); err != nil {
+	if err := c.lxcApplyTag(ctx, vmid, generation); err != nil {
 		cleanup()
 		return Server{}, err
 	}
@@ -320,13 +321,36 @@ func proxmoxLXCConfigProblem(config map[string]any, cfg Config, name string) err
 	}
 	rootfs := proxmoxConfigString(config["rootfs"])
 	storage, rest, _ := strings.Cut(rootfs, ":")
-	volume, _, _ := strings.Cut(rest, ",")
+	volume, options, _ := strings.Cut(rest, ",")
 	if storage != strings.TrimSpace(p.Storage) || volume == "" || strings.HasPrefix(volume, "/") {
 		return refuse("root disk is not a volume on the configured storage")
 	}
+	// Proxmox records the allocated size; every other root disk option
+	// (mount options, quota, read-only, shared, replication) is a change.
+	rootOptions := proxmoxConfigOptions(options)
+	if rootOptions["size"] != fmt.Sprintf("%dG", p.LXCDiskGiB) {
+		return refuse("root disk size differs from the request")
+	}
+	for key := range rootOptions {
+		if key != "size" {
+			return refuse("root disk option " + strconv.Quote(key) + " was not requested")
+		}
+	}
+	// The request is name, bridge, DHCP and veth. Proxmox adds only the MAC
+	// address; a VLAN tag, trunk, rate limit, MTU, firewall flag, static
+	// address, gateway or link state is a change.
 	net0 := proxmoxConfigOptions(proxmoxConfigString(config["net0"]))
-	if net0["bridge"] != strings.TrimSpace(p.Bridge) || net0["name"] != "eth0" {
-		return refuse("network differs from the request")
+	for key, want := range map[string]string{"name": "eth0", "bridge": strings.TrimSpace(p.Bridge), "ip": "dhcp", "type": "veth"} {
+		if net0[key] != want {
+			return refuse("network " + key + " differs from the request")
+		}
+	}
+	for key := range net0 {
+		switch key {
+		case "name", "bridge", "ip", "type", "hwaddr":
+		default:
+			return refuse("network option " + strconv.Quote(key) + " was not requested")
+		}
 	}
 	return nil
 }
@@ -628,21 +652,58 @@ func (c *ProxmoxClient) lxcStopIfRunning(ctx context.Context, vmid int) error {
 	}
 }
 
-// lxcPreserveGeneration keeps the generation label a container was created
-// with. The label lives in the description, which every label write
-// replaces, so a writer that omits it would erase the container's identity.
-// A different generation is refused.
-func (c *ProxmoxClient) lxcPreserveGeneration(ctx context.Context, vmid int, labels map[string]string) (map[string]string, error) {
+// lxcConfigFence is one read of a container's configuration: the labels it
+// carries, its valid generation, and Proxmox's config digest. A write that
+// carries the digest is refused by Proxmox, under its config lock, if the
+// configuration changed after this read.
+type lxcConfigFence struct {
+	labels     map[string]string
+	generation string
+	digest     string
+}
+
+// lxcReadConfigFence refuses a container without a valid, non-zero
+// generation label. Writing labels onto such a container would restore
+// stale ownership onto whatever now holds the VMID.
+func (c *ProxmoxClient) lxcReadConfigFence(ctx context.Context, vmid int) (lxcConfigFence, error) {
 	var config map[string]any
 	if err := c.doRequired(ctx, http.MethodGet, c.guestPath(vmid)+"/config", nil, &config); err != nil {
-		return nil, err
+		return lxcConfigFence{}, err
 	}
-	current := ""
+	fence := lxcConfigFence{labels: map[string]string{}, digest: proxmoxConfigString(config["digest"])}
 	if desc, ok := config["description"].(string); ok {
-		current = proxmoxLXCGenerationID(proxmoxDescriptionLabels(desc)[ProxmoxLXCGenerationLabel])
+		fence.labels = proxmoxDescriptionLabels(desc)
 	}
-	if current == "" {
-		return labels, nil
+	fence.generation = proxmoxLXCGenerationID(fence.labels[ProxmoxLXCGenerationLabel])
+	if fence.generation == "" {
+		return lxcConfigFence{}, fmt.Errorf("proxmox container %d has no valid generation label; refusing to write its configuration", vmid)
+	}
+	if fence.digest == "" {
+		return lxcConfigFence{}, fmt.Errorf("proxmox container %d configuration has no digest; refusing an unfenced write", vmid)
+	}
+	return fence, nil
+}
+
+// lxcApplyTag sets the lease tag on the container Crabbox just created,
+// fenced on the generation it created and the digest it read.
+func (c *ProxmoxClient) lxcApplyTag(ctx context.Context, vmid int, generation string) error {
+	fence, err := c.lxcReadConfigFence(ctx, vmid)
+	if err != nil {
+		return err
+	}
+	if fence.generation != generation {
+		return fmt.Errorf("proxmox container %d generation changed before its tag was applied", vmid)
+	}
+	return c.configureVM(ctx, vmid, url.Values{"tags": {proxmoxLeaseTag}, "digest": {fence.digest}})
+}
+
+// lxcFencedLabelForm is the label write for a container: the generation the
+// container carries is kept, a label set that names another generation is
+// refused, and the digest binds the write to the read.
+func (c *ProxmoxClient) lxcFencedLabelForm(ctx context.Context, vmid int, labels map[string]string) (url.Values, error) {
+	fence, err := c.lxcReadConfigFence(ctx, vmid)
+	if err != nil {
+		return nil, err
 	}
 	merged := maps.Clone(labels)
 	if merged == nil {
@@ -650,10 +711,78 @@ func (c *ProxmoxClient) lxcPreserveGeneration(ctx context.Context, vmid int, lab
 	}
 	switch merged[ProxmoxLXCGenerationLabel] {
 	case "":
-		merged[ProxmoxLXCGenerationLabel] = current
-	case current:
+		merged[ProxmoxLXCGenerationLabel] = fence.generation
+	case fence.generation:
 	default:
 		return nil, fmt.Errorf("proxmox container %d generation label does not match the container", vmid)
 	}
-	return merged, nil
+	return url.Values{"description": {proxmoxDescription(merged)}, "digest": {fence.digest}}, nil
+}
+
+// proxmoxLXCTagPolicyCheck confirms that this principal may add the lease
+// tag under the datacenter's tag policy, which Proxmox applies on top of
+// VM.Config.Options: registered tags need Sys.Modify, and user-tag-access
+// may limit unprivileged users to a list or to tags already in use. The
+// policy is read with Sys.Audit on /; without it the policy is unverified
+// and the check is not ready. It never asks for Sys.Modify.
+func (c *ProxmoxClient) proxmoxLXCTagPolicyCheck(ctx context.Context) ProxmoxReadinessCheck {
+	failed := func(class, hint, detail string) ProxmoxReadinessCheck {
+		return ProxmoxReadinessCheck{
+			Status: "failed", Check: "lxc_tag_policy",
+			Message: fmt.Sprintf("tag=%s class=%s hint=%s %s", proxmoxLeaseTag, class, hint, detail),
+			Details: map[string]string{"tag": proxmoxLeaseTag, "class": class, "hint": hint, "detail": detail},
+		}
+	}
+	var options struct {
+		RegisteredTags []string `json:"registered-tags"`
+		UserTagAccess  struct {
+			UserAllow     string   `json:"user-allow"`
+			UserAllowList []string `json:"user-allow-list"`
+		} `json:"user-tag-access"`
+	}
+	if err := c.doRequired(ctx, http.MethodGet, "/cluster/options", nil, &options); err != nil {
+		var apiErr *ProxmoxError
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusForbidden || apiErr.StatusCode == http.StatusUnauthorized) {
+			return failed("permission", "grant_sys_audit_on_root", "tag policy unverified: /cluster/options needs Sys.Audit on /")
+		}
+		return c.proxmoxFailedReadiness("lxc_tag_policy", "/cluster/options", err, map[string]string{"tag": proxmoxLeaseTag})
+	}
+	if slices.Contains(options.RegisteredTags, proxmoxLeaseTag) {
+		return failed("policy", "unregister_lease_tag", "the tag is a registered tag, which only Sys.Modify may set")
+	}
+	mode := strings.TrimSpace(options.UserTagAccess.UserAllow)
+	if mode == "" {
+		mode = "free"
+	}
+	switch mode {
+	case "free":
+	case "list", "existing":
+		if slices.Contains(options.UserTagAccess.UserAllowList, proxmoxLeaseTag) {
+			break
+		}
+		if mode == "list" {
+			return failed("policy", "add_lease_tag_to_user_allow_list", "user-tag-access is list and the tag is not in user-allow-list")
+		}
+		vms, err := c.listClusterVMs(ctx)
+		if err != nil {
+			return c.proxmoxFailedReadiness("lxc_tag_policy", "/cluster/resources", err, map[string]string{"tag": proxmoxLeaseTag})
+		}
+		inUse := false
+		for _, vm := range vms {
+			if slices.Contains(strings.Split(vm.Tags, ";"), proxmoxLeaseTag) {
+				inUse = true
+				break
+			}
+		}
+		if !inUse {
+			return failed("policy", "add_lease_tag_to_user_allow_list", "user-tag-access is existing and no visible guest carries the tag")
+		}
+	default:
+		return failed("policy", "set_user_tag_access", "user-tag-access is "+strconv.Quote(mode)+", which forbids unprivileged tags")
+	}
+	return ProxmoxReadinessCheck{
+		Status: "ok", Check: "lxc_tag_policy",
+		Message: fmt.Sprintf("tag=%s user_tag_access=%s tag_policy=ready", proxmoxLeaseTag, mode),
+		Details: map[string]string{"tag": proxmoxLeaseTag, "user_tag_access": mode, "tag_policy": "ready"},
+	}
 }

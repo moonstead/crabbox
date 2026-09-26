@@ -362,11 +362,16 @@ For each lease, Crabbox:
    tag: Proxmox checks tags against `/vms/<vmid>` without the pool ACL, so a
    pool-scoped token may set `tags=crabbox` only in a configuration update
    after the container has joined the pool, which is the next step.
-2. Applies `tags=crabbox` with `PUT /nodes/<node>/lxc/<vmid>/config`, then
-   reads the configuration back and refuses the container if any other key is
-   present, it is not unprivileged, the tag is missing, or a resource, disk or
-   network value differs. A refused container is deleted, or kept in fixed
-   custody for checked release.
+2. Applies `tags=crabbox` with `PUT /nodes/<node>/lxc/<vmid>/config`, fenced
+   on the generation it created and the configuration digest it just read,
+   then reads the configuration back and refuses the container if any key
+   outside the requested shape is present, it is not unprivileged, the tag is
+   missing, `hostname`, `cores`, `memory` or `swap` differ, the root disk is
+   not a volume of the requested size on the requested storage or carries any
+   other option, or `net0` is not exactly `name=eth0`, the requested bridge,
+   `ip=dhcp` and `type=veth` plus the MAC address Proxmox assigns. A refused
+   container is deleted, or kept in fixed custody for checked release. A
+   failed tag update is treated the same way; it is not a rejected create.
 3. Starts it and reads eth0's IPv4 address from
    `/nodes/<node>/lxc/<vmid>/interfaces`. There is no guest agent.
 4. Connects once as `root`, because Proxmox installs a create-time key only
@@ -385,9 +390,14 @@ LXC has no `vmgenid`. Each container instead gets a random 128-bit
 `lxc_generation` label at creation. A fixed lease binds that value exactly as
 it binds `vmgenid` for QEMU, before the configuration audit, so a refused
 container stays in custody for checked release. The label lives in the
-container description, which every label update replaces, so each update
-first reads the current generation back: an update that omits it keeps it,
-and an update that names another generation is refused. Release stops the
+container description, which every label update replaces, so every label
+writer first reads the container back and refuses to write when the live
+generation is missing, malformed or zero, because that VMID no longer holds
+a container Crabbox created. An update that omits the generation keeps the
+live one, an update that names another generation is refused, and every
+write carries the configuration `digest` it read, which Proxmox compares
+under its config lock, so a replacement between the read and the write is
+refused as well. Release stops the
 container only when Proxmox reports it `running`, because Proxmox refuses to
 stop a stopped container; a `stopped` container, such as one refused before
 its first start or one that exited on its own, is deleted directly, and any
@@ -425,6 +435,11 @@ lxc_permissions
            guest=lxc only: the pool or /vms, root-disk storage, template
            storage, the bridge's SDN zone and the node grant every privilege
            the container lifecycle and prepared-claim recovery need
+lxc_tag_policy
+           guest=lxc only: /cluster/options shows that this principal may
+           add the crabbox tag (not a registered tag; user-tag-access free,
+           or list or existing with the tag allowed); unreadable policy is
+           reported as unverified and not ready
 nextid     /cluster/nextid is readable
 pool       configured /pools/<pool> is readable, when set
 inventory  /vms has propagated VM.Audit and cluster inventory is readable
@@ -460,7 +475,10 @@ the tag is applied after the container joins the pool. It also needs
 `Datastore.AllocateSpace` on the template's storage, `SDN.Use` on
 `/sdn/zones/localnetwork/<bridge>`, and `Sys.Audit` on `/nodes/<node>` for
 prepared-claim recovery. It needs no template VM grant. Doctor's
-`lxc_permissions` check names every missing privilege.
+`lxc_permissions` check names every missing privilege, and `lxc_tag_policy`
+checks the datacenter tag policy that Proxmox applies on top of
+`VM.Config.Options`. Registered tags need `Sys.Modify`; do not grant it to
+the lease principal, unregister the tag or allow it for users instead.
 
 The exact least-privilege role depends on the Proxmox VE version and local ACL
 model. If doctor fails with `class=permission`, fix the named endpoint first and
