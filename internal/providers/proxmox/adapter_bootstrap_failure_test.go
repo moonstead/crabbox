@@ -51,6 +51,10 @@ type adapterChildState struct {
 	Deleted    []string              `json:"deleted"`
 	Commands   []string              `json:"commands"`
 	Failed     *adapterFailedAttempt `json:"failed,omitempty"`
+	// CloneFailure is "rejected" for a definite 403 from the clone endpoint or
+	// "uncertain" for a failure after the clone was submitted.
+	CloneFailure string   `json:"cloneFailure,omitempty"`
+	Errors       []string `json:"errors,omitempty"`
 }
 
 func (vm adapterChildVM) server() core.Server {
@@ -69,12 +73,24 @@ type adapterChildClient struct{ *fixedProxmoxClient }
 func (c *adapterChildClient) CreateServerWithVMID(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, vmid int, labels map[string]string, bind func(core.Server) error) (core.Server, error) {
 	others := slices.Clone(c.servers)
 	server, err := c.fixedProxmoxClient.CreateServerWithVMID(ctx, cfg, publicKey, leaseID, slug, keep, vmid, labels, bind)
-	for i := range c.servers {
+	created := slices.DeleteFunc(c.servers, func(candidate core.Server) bool {
+		return slices.ContainsFunc(others, func(other core.Server) bool { return other.CloudID == candidate.CloudID })
+	})
+	for i := range created {
 		// Release reads provider state only; keep best-effort guest cleanup offline.
-		c.servers[i].PublicNet.IPv4.IP = ""
+		created[i].PublicNet.IPv4.IP = ""
 	}
-	c.servers = append(others, c.servers...)
+	c.servers = append(others, created...)
 	return server, err
+}
+
+// Like the real client, an empty pool lists as [] rather than null.
+func (c *adapterChildClient) ListCrabboxServersCluster(ctx context.Context) ([]core.Server, error) {
+	servers, err := c.fixedProxmoxClient.ListCrabboxServersCluster(ctx)
+	if servers == nil && err == nil {
+		servers = []core.Server{}
+	}
+	return servers, err
 }
 
 func readAdapterChildState(path string) (adapterChildState, error) {
@@ -91,7 +107,12 @@ func writeAdapterChildState(path string, state adapterChildState) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	// Replace atomically: an operator command may run beside an adapter child.
+	temporary := path + ".tmp-" + strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(temporary, path)
 }
 
 // runAdapterChild is one crabbox child command. Bootstrap always fails, as it
@@ -106,6 +127,13 @@ func runAdapterChild(path string, args []string) int {
 	client := &adapterChildClient{&fixedProxmoxClient{fakeProxmoxDoctorClient: &fakeProxmoxDoctorClient{}, nextVMID: 417, fixedCreates: state.Clones}}
 	for _, vm := range state.VMs {
 		client.servers = append(client.servers, vm.server())
+	}
+	switch state.CloneFailure {
+	case "rejected":
+		client.fixedCreateErr = &core.ProxmoxError{Method: http.MethodPost, Path: "/nodes/pve1/qemu/9400/clone", StatusCode: http.StatusForbidden,
+			Body: "Permission check failed (/sdn/zones/localnetwork/vmbr0, SDN.Use)"}
+	case "uncertain":
+		client.fixedCreateErr = errors.New("clone task status: http 403: Permission check failed")
 	}
 	newClient = func(core.Config) (proxmoxClient, error) { return client, nil }
 	bootstraps := state.Bootstraps
@@ -146,6 +174,8 @@ func runAdapterChild(path string, args []string) int {
 		return 70
 	}
 	if runErr != nil {
+		state.Errors = append(state.Errors, args[0]+": "+runErr.Error())
+		_ = writeAdapterChildState(path, state)
 		fmt.Fprintln(os.Stderr, runErr)
 		var exit core.ExitError
 		if core.AsExitError(runErr, &exit) {
@@ -154,6 +184,121 @@ func runAdapterChild(path string, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+type proxmoxAdapterHarness struct {
+	t         *testing.T
+	inventory string
+	client    *http.Client
+	logs      bytes.Buffer
+	served    chan error
+	cancel    context.CancelFunc
+	stopped   bool
+}
+
+const proxmoxAdapterTestToken = "adapter-test-token"
+
+// startProxmoxAdapter runs adapter serve in this process. Its crabbox children
+// are this test binary, sharing the fake inventory file.
+func startProxmoxAdapter(t *testing.T, dir, inventory string, extraArgs ...string) *proxmoxAdapterHarness {
+	t.Helper()
+	t.Setenv(adapterChildStateEnv, inventory)
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte(proxmoxAdapterTestToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	socketDir, err := os.MkdirTemp("", "cbx-adapter-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "adapter.sock")
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	h := &proxmoxAdapterHarness{t: t, inventory: inventory, served: make(chan error, 1), cancel: cancel}
+	args := append([]string{"adapter", "serve",
+		"--provider", "proxmox", "--token-file", tokenFile, "--state-file", filepath.Join(dir, "adapter-state.json"),
+		"--listen", "127.0.0.1:0", "--unix-socket", socket, "--crabbox-binary", binary, "--work-dir", dir}, extraArgs...)
+	go func() { h.served <- (core.App{Stdout: io.Discard, Stderr: &h.logs}).Run(ctx, args) }()
+	t.Cleanup(func() { _ = h.stop() })
+	h.client = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	}}}
+	deadline := time.Now().Add(time.Minute)
+	for {
+		if code, _ := h.call(http.MethodGet, "/v1/workspaces/probe", nil); code != 0 {
+			return h
+		}
+		select {
+		case err := <-h.served:
+			h.stopped = true
+			t.Fatalf("adapter exited: %v\n%s", err, h.logs.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("adapter did not start")
+		}
+	}
+}
+
+func (h *proxmoxAdapterHarness) call(method, path string, body any) (int, map[string]any) {
+	h.t.Helper()
+	var payload io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		payload = bytes.NewReader(data)
+	}
+	request, err := http.NewRequest(method, "http://adapter"+path, payload)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+proxmoxAdapterTestToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := h.client.Do(request)
+	if err != nil {
+		return 0, nil
+	}
+	defer response.Body.Close()
+	var decoded map[string]any
+	_ = json.NewDecoder(response.Body).Decode(&decoded)
+	return response.StatusCode, decoded
+}
+
+// wait polls one workspace until done accepts it with the fake inventory.
+func (h *proxmoxAdapterHarness) wait(id string, timeout time.Duration, done func(map[string]any, adapterChildState) bool) (map[string]any, adapterChildState) {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		_, workspace := h.call(http.MethodGet, "/v1/workspaces/"+id, nil)
+		state, err := readAdapterChildState(h.inventory)
+		if err == nil && done(workspace, state) {
+			return workspace, state
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("workspace %s did not reach the expected state: %v; children=%v deleted=%v errors=%q", id, workspace, state.Commands, state.Deleted, state.Errors[:min(len(state.Errors), 3)])
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (h *proxmoxAdapterHarness) stop() error {
+	if h.stopped {
+		return nil
+	}
+	h.stopped = true
+	h.cancel()
+	return <-h.served
+}
+
+func adapterWorkspaceSettled(workspace map[string]any, _ adapterChildState) bool {
+	status, _ := workspace["status"].(string)
+	return status != "" && status != "provisioning" && status != "stopping"
 }
 
 // A fixed clone succeeds and its generation is bound, then bootstrap fails.
@@ -197,100 +342,13 @@ func testProxmoxAdapterBootstrapFailure(t *testing.T, registered bool) {
 	if err := writeAdapterChildState(inventory, adapterChildState{VMs: []adapterChildVM{other}}); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(adapterChildStateEnv, inventory)
-	const token = "adapter-test-token"
-	tokenFile := filepath.Join(dir, "token")
-	if err := os.WriteFile(tokenFile, []byte(token+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	socketDir, err := os.MkdirTemp("", "cbx-adapter-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-	socket := filepath.Join(socketDir, "adapter.sock")
-	binary, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	var logs bytes.Buffer
-	served := make(chan error, 1)
-	go func() {
-		// The default --create-timeout is 60 minutes.
-		served <- (core.App{Stdout: io.Discard, Stderr: &logs}).Run(ctx, []string{"adapter", "serve",
-			"--provider", "proxmox", "--token-file", tokenFile, "--state-file", filepath.Join(dir, "adapter-state.json"),
-			"--listen", "127.0.0.1:0", "--unix-socket", socket, "--crabbox-binary", binary, "--work-dir", dir})
-	}()
-	stopped := false
-	stop := func() error {
-		if stopped {
-			return nil
-		}
-		stopped = true
-		cancel()
-		return <-served
-	}
-	t.Cleanup(func() { _ = stop() })
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-	}}}
-	call := func(method, path string, body any) (int, map[string]any) {
-		t.Helper()
-		var payload io.Reader
-		if body != nil {
-			data, err := json.Marshal(body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			payload = bytes.NewReader(data)
-		}
-		request, err := http.NewRequest(method, "http://adapter"+path, payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		request.Header.Set("Authorization", "Bearer "+token)
-		request.Header.Set("Content-Type", "application/json")
-		response, err := client.Do(request)
-		if err != nil {
-			return 0, nil
-		}
-		defer response.Body.Close()
-		var decoded map[string]any
-		_ = json.NewDecoder(response.Body).Decode(&decoded)
-		return response.StatusCode, decoded
-	}
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		if code, _ := call(http.MethodGet, "/v1/workspaces/probe", nil); code != 0 {
-			break
-		}
-		select {
-		case err := <-served:
-			stopped = true
-			t.Fatalf("adapter exited: %v\n%s", err, logs.String())
-		case <-time.After(20 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("adapter did not start")
-		}
-	}
-	if code, body := call(http.MethodPost, "/v1/workspaces", map[string]any{"id": "bootstrap-failure"}); code != http.StatusAccepted {
+	// The default --create-timeout is 60 minutes.
+	adapter := startProxmoxAdapter(t, dir, inventory)
+	if code, body := adapter.call(http.MethodPost, "/v1/workspaces", map[string]any{"id": "bootstrap-failure"}); code != http.StatusAccepted {
 		t.Fatalf("create status=%d body=%v", code, body)
 	}
-	var workspace map[string]any
-	for {
-		_, workspace = call(http.MethodGet, "/v1/workspaces/bootstrap-failure", nil)
-		if status, _ := workspace["status"].(string); status != "" && status != "provisioning" && status != "stopping" {
-			break
-		}
-		if time.Now().After(deadline) {
-			state, _ := readAdapterChildState(inventory)
-			t.Fatalf("workspace never finished: %v; children=%v deleted=%v", workspace, state.Commands, state.Deleted)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if err := stop(); err != nil {
+	workspace, _ := adapter.wait("bootstrap-failure", 2*time.Minute, adapterWorkspaceSettled)
+	if err := adapter.stop(); err != nil {
 		t.Fatalf("adapter serve: %v", err)
 	}
 	if workspace["status"] != "failed" || workspace["message"] != "workspace provisioning failed before provider identity acknowledgment" {
@@ -329,7 +387,7 @@ func testProxmoxAdapterBootstrapFailure(t *testing.T, registered bool) {
 	if receipt.FixedCreateIntent.State != "released" || receipt.CloudID != "417" || receipt.CloudImmutableID != fixedTestGeneration {
 		t.Fatalf("receipt=%+v", receipt)
 	}
-	if strings.Contains(logs.String(), controllerTestSecret) {
+	if strings.Contains(adapter.logs.String(), controllerTestSecret) {
 		t.Fatal("adapter log exposed the token secret")
 	}
 	coordinatorMu.Lock()

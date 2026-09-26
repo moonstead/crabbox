@@ -569,6 +569,15 @@ When the adapter confirms that a released VM is absent, it finishes cleanup and
 keeps the released claim as the lease ID's receipt, as direct `stop` does. If an
 acquisition failed before Crabbox wrote that claim, confirmed-absence cleanup
 fails closed and the workspace stays `stopping` until an operator inspects it.
+This includes a definite clone rejection, which removes the claim so that the
+fixed ID can be retried.
+
+If the adapter never recorded the VM's identity, for example because an
+operator released the attempt with `crabbox stop` or `crabbox stop --force`
+first, cleanup accepts only a released receipt for the same attempt ID, slug and
+scope that was never registered with a coordinator. A prepared claim, such as
+one left by an uncertain clone, is never settled this way. Its workspace stays
+`stopping` until an operator inspects and releases the attempt.
 
 ## Troubleshooting
 
