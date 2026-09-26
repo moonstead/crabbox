@@ -1316,7 +1316,7 @@ func TestProxmoxBootstrapNativeDiagnostics(t *testing.T) {
 			client := &ProxmoxClient{TokenID: "fixture@pve!proof", TokenSecret: "synthetic-pve-secret"}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			err := client.bootstrapSSH(ctx, "fixture.invalid", cfg)
+			err := client.bootstrapSSH(ctx, "fixture.invalid", cfg, "", "")
 			input, readErr := os.ReadFile(inputPath)
 			if readErr != nil || string(input) != proxmoxBootstrapScript(cfg) {
 				t.Fatalf("bootstrap input delivery mismatch: %v", readErr)
@@ -1361,7 +1361,7 @@ func TestProxmoxBootstrapPreservesCause(t *testing.T) {
 			proxmoxRunSSHQuietWithOptions = func(context.Context, SSHTarget, string, string, string) error { return nil }
 			proxmoxRunSSHInput = func(context.Context, SSHTarget, string, io.Reader, io.Writer, io.Writer) error { return cause }
 			t.Cleanup(func() { proxmoxRunSSHQuietWithOptions, proxmoxRunSSHInput = probe, input })
-			err := (&ProxmoxClient{}).bootstrapSSH(context.Background(), "fixture.invalid", baseConfig())
+			err := (&ProxmoxClient{}).bootstrapSSH(context.Background(), "fixture.invalid", baseConfig(), "", "")
 			if !errors.Is(err, cause) || ExitCodeForError(err, 1) != 1 {
 				t.Fatalf("cause or code lost: %v", err)
 			}
@@ -1382,7 +1382,7 @@ func TestProxmoxBootstrapProbeFailureDoesNotRunInput(t *testing.T) {
 		return nil
 	}
 	t.Cleanup(func() { proxmoxRunSSHQuietWithOptions, proxmoxRunSSHInput = probe, input })
-	if err := (&ProxmoxClient{}).bootstrapSSH(ctx, "fixture.invalid", baseConfig()); !errors.Is(err, context.Canceled) {
+	if err := (&ProxmoxClient{}).bootstrapSSH(ctx, "fixture.invalid", baseConfig(), "", ""); !errors.Is(err, context.Canceled) {
 		t.Fatalf("probe cause=%v", err)
 	}
 }
@@ -1403,10 +1403,17 @@ func testProxmoxCreateServerFlow(t *testing.T, failBootstrap bool) {
 	var forms []url.Values
 	var events []string
 	var bootstrapInput string
+	var sshTargets []SSHTarget
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	hostKey := testProxmoxGuestHostKey(t)
 	origProbe := proxmoxRunSSHQuietWithOptions
 	origInput := proxmoxRunSSHInput
-	proxmoxRunSSHQuietWithOptions = func(context.Context, SSHTarget, string, string, string) error { return nil }
-	proxmoxRunSSHInput = func(ctx context.Context, _ SSHTarget, _ string, input io.Reader, stdout, stderr io.Writer) error {
+	proxmoxRunSSHQuietWithOptions = func(_ context.Context, target SSHTarget, _ string, _ string, _ string) error {
+		sshTargets = append(sshTargets, target)
+		return nil
+	}
+	proxmoxRunSSHInput = func(ctx context.Context, target SSHTarget, _ string, input io.Reader, stdout, stderr io.Writer) error {
+		sshTargets = append(sshTargets, target)
 		data, err := io.ReadAll(input)
 		if err != nil {
 			return err
@@ -1467,6 +1474,12 @@ func testProxmoxCreateServerFlow(t *testing.T, failBootstrap bool) {
 		case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/agent/exec":
 			forms = append(forms, readForm(t, r))
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"pid": 77}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/agent/file-read":
+			if r.URL.Query().Get("file") != "/etc/ssh/ssh_host_ed25519_key.pub" {
+				t.Fatalf("file-read file=%q", r.URL.Query().Get("file"))
+			}
+			events = append(events, "read-host-key")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"content": hostKey + " root@guest\n", "truncated": false}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/agent/exec-status":
 			if r.URL.Query().Get("pid") != "77" {
 				t.Fatalf("pid=%s", r.URL.Query().Get("pid"))
@@ -1505,7 +1518,7 @@ func testProxmoxCreateServerFlow(t *testing.T, failBootstrap bool) {
 		if !errors.As(err, &native) || native.ExitCode() != 7 || !strings.Contains(err.Error(), "fixture-bootstrap-cleanup-diagnostic") || !strings.Contains(err.Error(), "proxmox guest bootstrap") {
 			t.Errorf("bootstrap diagnostic/cause lost after cleanup: %v", err)
 		}
-		want := []string{"clone", "wait-clone", "config", "wait-config", "start", "wait-start", "stop", "wait-cleanup", "delete", "wait-cleanup"}
+		want := []string{"clone", "wait-clone", "config", "wait-config", "start", "wait-start", "read-host-key", "config", "wait-config", "stop", "wait-cleanup", "delete", "wait-cleanup"}
 		if !reflect.DeepEqual(events, want) {
 			t.Fatalf("events=%v want %v", events, want)
 		}
@@ -1526,9 +1539,22 @@ func testProxmoxCreateServerFlow(t *testing.T, failBootstrap bool) {
 	if !strings.Contains(bootstrapInput, "crabbox-ready") {
 		t.Fatalf("bootstrap input=%q", bootstrapInput)
 	}
-	wantEvents := []string{"clone", "wait-clone", "config", "wait-config", "start", "wait-start"}
+	wantEvents := []string{"clone", "wait-clone", "config", "wait-config", "start", "wait-start", "read-host-key", "config", "wait-config"}
 	if !reflect.DeepEqual(events, wantEvents) {
 		t.Fatalf("events=%v want %v", events, wantEvents)
+	}
+	// The key is recorded where the guest cannot change it, before any SSH.
+	if !strings.Contains(forms[2].Get("description"), "ssh_host_key="+hostKey+"\n") {
+		t.Fatalf("label form=%v", forms[2])
+	}
+	if len(sshTargets) == 0 {
+		t.Fatal("no SSH connection was made")
+	}
+	for _, target := range sshTargets {
+		args := strings.Join(sshHostKeyVerificationArgs(target), " ")
+		if target.SSHHostKey != hostKey || !strings.Contains(args, "StrictHostKeyChecking=yes") || !strings.Contains(args, "HostKeyAlias=crabbox-lease-") {
+			t.Fatalf("bootstrap SSH trusted first use: key=%q args=%s", target.SSHHostKey, args)
+		}
 	}
 }
 
