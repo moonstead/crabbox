@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add an unbranded embedded WebVNC viewer for one configured origin: `CRABBOX_WEBVNC_EMBED_ORIGIN` enables `embed: true` viewer tickets (echoed with `embedContract`), `POST /portal/leases/{lease}/vnc/embed/bootstrap`, `GET /portal/leases/{lease}/vnc/embed` and its own session routes under `/vnc/embed`, framed only by that origin with a separate partitioned `crabbox_webvnc_embed_session` cookie that cannot collide with the portal viewer cookie; enabled bootstrap and viewer-page failures are frameable notices with a `session-required`, `external-open-required` or `unavailable` status message; missing embed sessions return non-redirecting 401s, connected expiry stops once, and transient recovery is bounded; portal viewer pages keep `frame-ancestors 'none'`.
 - Keep background telemetry from replacing workspace command witnesses and failing successful hydration reads with exit 74. [PR 2563](https://github.com/openclaw/crabbox/pull/2563).
 - Remove Proxmox fixed-ID prepared claims after definite pre-allocation authorization rejections and add checked `stop --force` recovery for absent, unbound attempts. [Fixes #2559](https://github.com/openclaw/crabbox/issues/2559). Thanks @ahkohd.
 - Fix WSL2 static targets for non-administrator Windows accounts by removing WMI shell discovery and accepting read-only app-capability grants on HOME while preserving private stage ACLs. [Issue 2543](https://github.com/openclaw/crabbox/issues/2543), [PR 2546](https://github.com/openclaw/crabbox/pull/2546). Thanks @altaywtf.

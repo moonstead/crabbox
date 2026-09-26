@@ -26,6 +26,8 @@ POST /portal/leases/{id-or-slug}/share          add/remove user, set org, clear
 POST /portal/leases/{id-or-slug}/release        stop, delete via adapter, or remove registration
 POST /portal/leases/{id-or-slug}/vnc/bootstrap  consume an Agent viewer ticket
 GET  /portal/leases/{id-or-slug}/vnc            WebVNC viewer page
+POST /portal/leases/{id-or-slug}/vnc/embed/bootstrap  consume an embed viewer ticket
+GET  /portal/leases/{id-or-slug}/vnc/embed      unbranded WebVNC viewer for one embedding origin
 GET  /portal/leases/{id-or-slug}/code/...       code-server bridge (HTTP/WS proxy)
 GET  /portal/runs/{run-id}                       run detail
 GET  /portal/runs/{run-id}/logs                  retained log (text/plain)
@@ -117,6 +119,110 @@ viewer page suppresses those controls, and server authorization independently
 enforces the same restriction. Expiry, ticket replay, lease mismatch, principal
 mismatch, shared/admin token rotation, and grant revocation all fail closed.
 Existing GitHub Portal sessions remain unchanged.
+
+### Embedded viewer
+
+An application that already holds a shared or admin bearer token can show a
+desktop inside its own page without the portal shell. Embed mode is off until
+`CRABBOX_WEBVNC_EMBED_ORIGIN` names exactly one `https://` origin (or
+`http://localhost[:port]` for development). A value with a path, query,
+credentials, wildcard or more than one origin disables the mode again.
+
+The contract is the ticket flow above with `embed: true`:
+
+1. `POST /v1/leases/{id}/webvnc/viewer-bootstrap` with a bearer token and a
+   JSON body `{"credentialHandoffTicket": "...", "embed": true,
+   "takeControl": true}` returns `{ticket, leaseID, expiresAt, embed: true,
+   embedContract: "crabbox-webvnc-embed/1"}`. The application should require
+   that `embedContract` value before it posts the ticket into a frame: an
+   older coordinator ignores `embed` and returns neither field. The ticket is
+   one-use, expires after 120 seconds and is redeemable only at the embed
+   bootstrap. When embed mode is off the request fails with
+   `409 webvnc_embed_unavailable` and no ticket is stored.
+2. The application's page submits a form with a single field `ticket` to
+   `POST /portal/leases/{id}/vnc/embed/bootstrap`, targeting an `iframe` that
+   it owns. The ticket travels only in that POST body. The response consumes
+   the ticket, sets a `crabbox_webvnc_embed_session` cookie with `HttpOnly;
+   Secure; SameSite=None; Partitioned; Max-Age=<remaining session seconds>`
+   on the lease's `/vnc/embed` path, and replaces the frame's location with
+   `GET /portal/leases/{id}/vnc/embed?bootstrapped=1`. Any ticket presented at
+   the wrong bootstrap is rejected and burned. The cookie name and path are
+   distinct from the portal viewer's `crabbox_webvnc_session` on `/vnc`, so an
+   inline frame and a portal tab for the same lease can coexist in one
+   browser, including when the embedding site and the coordinator are
+   same-site and both cookies travel together.
+3. The embed page renders only the noVNC display and its own controls: status,
+   sizing, take control, clipboard, reconnect and fullscreen. It has no brand,
+   navigation, log out, share or bridge command, never names the lease, and
+   its status wording and error messages carry no product name or CLI hint.
+   Fullscreen inside a frame needs `allow="fullscreen"` on the `iframe`. The
+   viewer talks only to `/portal/leases/{id}/vnc/embed/{status,control,theme,
+   handoff,viewer}`, which read only the embed cookie. Reloading the frame in
+   place reuses the same session and returns to the same desktop until the
+   session's 30-minute lifetime, the lease, the grant or the token behind it
+   ends.
+
+When embed mode is enabled, the bootstrap and viewer page return HTML with
+`frame-ancestors <configured origin>`. Bootstrap failures and unavailable
+viewer pages include a status message for the parent. Disabled embed mode
+returns an unframeable 404. Other portal pages keep `frame-ancestors 'none'`.
+The embed session opens nothing in the portal shell, a portal session opens
+nothing in the embed viewer, and embedded viewers never hand a session to
+another tab.
+
+Embed session endpoints return JSON or a WebSocket upgrade, not viewer HTML.
+On the exact `/vnc/embed/{status,control,theme,handoff,viewer}` routes, a
+missing, malformed or expired browser session gets a non-redirecting 401
+JSON response with `frame-ancestors 'none'`, never the portal login page.
+Reaching this handler grants no authentication. The frame turns that 401
+into a single `session-required` signal, including during connected polling.
+Cookie-bearing mutations and WebSocket upgrades require the coordinator's
+own origin. Cross-origin safe GETs can reach the coordinator, but the browser
+prevents the embedding page from reading their responses. It also prevents
+that page from reading the HttpOnly cookie, desktop credentials or frame
+history.
+
+The frame reports status only. The notice and the viewer post
+`{type: "crabbox-webvnc-embed", contract: "crabbox-webvnc-embed/1", leaseID,
+state, message}` to `window.parent` with the configured origin as the only
+target. `state` is one of:
+
+- `session-required`: no valid session, an expired or burned ticket at the
+  bootstrap, or a frame that cannot recover its one-use desktop credentials
+  (a frame element that was recreated, or a second frame for the same lease
+  whose bootstrap replaced the shared cookie). The frame stops and posts
+  this once per connection attempt. The application may mint a fresh ticket
+  and repeat step 2, with its own limit on automatic remints. Same-lease
+  frames share a cookie, so a cold remount should always use a fresh ticket.
+  Nothing in the message lets the frame mint a ticket by itself.
+- `external-open-required`: the bootstrap set the cookie but the marked first
+  load of the viewer arrived without it, so this browser refuses partitioned
+  cross-site cookies. The frame posts this once; the application should open
+  the desktop in a new tab through the portal ticket flow instead of minting
+  another embed ticket.
+- `unavailable`: the lease is not active, has no desktop or is not visible;
+  also the answer to a malformed bootstrap request, a terminal handoff
+  failure, or exhaustion of the viewer's retry budget
+- `connected` and `disconnected`: the viewer's VNC connection state.
+
+The viewer stops on handoff 401 with `session-required`. Other handoff 4xx
+responses stop with `unavailable`, except 408 and 429. Network failures,
+timeouts, 408, 429 and server failures can retry at most 5 times after the
+initial attempt. Each handoff request has a 10-second timeout. Exhausting
+that budget stops the viewer and sends `unavailable`; manual Reconnect
+starts a new budget. An established connection also resets the budget.
+
+The parent must check both `event.origin` and
+`event.source === iframe.contentWindow`, then the exact message type and
+contract. Messages from another Desktop frame must not trigger a remint.
+The parent should bound automatic remints separately and offer one
+user-driven new-tab fallback on `external-open-required`, rather than
+retrying embeds or opening repeated popups.
+
+Take control stays inside the authenticated viewer session, through
+`takeControl` at minting and the viewer's own button. This is where later
+viewer-session controls belong; the desktop's agent and the viewer still share
+one operating system user, so the embed contract claims no exclusive control.
 
 ```text
 session  authenticated GitHub user (owner / org embedded in the token)

@@ -38179,6 +38179,8 @@ describe("fleet lease identity and idle", () => {
       },
     };
     const reloadContext = createContext({
+      collaborationOperation: (operation: (signal: AbortSignal) => Promise<unknown>) =>
+        operation(new AbortController().signal),
       fetch: vi.fn<() => Promise<Response>>(
         async () =>
           new Response(
@@ -38436,6 +38438,10 @@ describe("fleet lease identity and idle", () => {
       `${lease}/vnc/bootstrap/extra`,
       `${lease}/vnc/bootstrapx`,
       `${lease}/bootstrap`,
+      `${lease}/vnc/embed/bootstrap/`,
+      `${lease}/vnc/embed/bootstrapx`,
+      `${lease}/vnc/embedx/bootstrap`,
+      `${lease}/vnc/embed/embed/bootstrap`,
     ];
     const denied: Request[] = [];
     for (const cookie of cookies) {
@@ -38493,6 +38499,684 @@ describe("fleet lease identity and idle", () => {
         );
       }),
     );
+  });
+
+  it("bootstraps an unbranded embedded WebVNC viewer for the configured frame ancestor", async () => {
+    const storage = new MemoryStorage();
+    const embedOrigin = "https://bb.example.test";
+    const env = {
+      CRABBOX_SHARED_TOKEN: "shared-operator-token",
+      CRABBOX_SHARED_OWNER: "automation@example.com",
+      CRABBOX_DEFAULT_ORG: "example-org",
+      CRABBOX_PUBLIC_URL: "https://crabbox.test",
+      CRABBOX_WEBVNC_EMBED_ORIGIN: embedOrigin,
+    } as Env;
+    const fleet = new FleetDurableObject({ storage } as unknown as DurableObjectState, env);
+    storage.seed(
+      "lease:cbx_000000000001",
+      testLease({
+        id: "cbx_000000000001",
+        slug: "blue-lobster",
+        owner: "automation@example.com",
+        org: "example-org",
+        desktop: true,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      }),
+    );
+    const throughCoordinator = async (input: Request): Promise<Response> =>
+      await routeCoordinatorRequest(input, env, async (prepared) => await fleet.fetch(prepared));
+    const bearerHeaders = {
+      authorization: "Bearer shared-operator-token",
+      "content-type": "application/json",
+    };
+    const mintViewerTicket = async (
+      body: Record<string, unknown>,
+    ): Promise<{ ticket: string; handoff: string; body: Record<string, unknown> }> => {
+      const handoff = await throughCoordinator(
+        new Request("https://crabbox.test/v1/leases/blue-lobster/webvnc/handoff", {
+          method: "POST",
+          headers: bearerHeaders,
+          body: JSON.stringify({ username: "vnc-user", password: "generated-vnc-password" }),
+        }),
+      );
+      expect(handoff.status).toBe(200);
+      const { ticket: handoffTicket } = (await handoff.json()) as { ticket: string };
+      const issued = await throughCoordinator(
+        new Request("https://crabbox.test/v1/leases/blue-lobster/webvnc/viewer-bootstrap", {
+          method: "POST",
+          headers: bearerHeaders,
+          body: JSON.stringify({ credentialHandoffTicket: handoffTicket, ...body }),
+        }),
+      );
+      expect(issued.status).toBe(200);
+      expect(issued.headers.get("cache-control")).toBe("no-store");
+      const issuedBody = (await issued.json()) as Record<string, unknown>;
+      expect(JSON.stringify(issuedBody)).not.toContain("shared-operator-token");
+      expect(JSON.stringify(issuedBody)).not.toContain("/portal/");
+      return { ticket: issuedBody.ticket as string, handoff: handoffTicket, body: issuedBody };
+    };
+    const embedBootstrapURL =
+      "https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/bootstrap";
+    const portalBootstrapURL = "https://crabbox.test/portal/leases/cbx_000000000001/vnc/bootstrap";
+    const bootstrap = async (
+      url: string,
+      ticket: string,
+      headers: Record<string, string> = {},
+    ): Promise<Response> =>
+      await throughCoordinator(
+        new Request(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            origin: embedOrigin,
+            ...headers,
+          },
+          body: new URLSearchParams({ ticket }),
+        }),
+      );
+    const expectTicketRequired = async (response: Response): Promise<void> => {
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toMatchObject({
+        error: "webvnc_viewer_ticket_required",
+      });
+    };
+    // The embed bootstrap fails inside the frame, so a bad ticket is a
+    // frameable notice that asks the embedding origin for a fresh one.
+    const expectEmbedNotice = async (
+      response: Response,
+      state: string,
+      status: number,
+    ): Promise<string> => {
+      expect(response.status).toBe(status);
+      expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("location")).toBeNull();
+      const csp = response.headers.get("content-security-policy") ?? "";
+      expect(csp).toContain(`frame-ancestors ${embedOrigin}`);
+      expect(csp).toContain("default-src 'none'");
+      const body = await response.text();
+      expect(body).toContain(`"state":${JSON.stringify(state)}`);
+      expect(body).toContain('"contract":"crabbox-webvnc-embed/1"');
+      expect(body).toContain(`,${JSON.stringify(embedOrigin)})`);
+      expect(body).not.toContain("/portal/login");
+      expect(body).not.toContain("href=");
+      // Only the machine-readable message type names the product; nothing
+      // the frame shows does.
+      const visible = body.replace(/<script[\s\S]*?<\/script>/g, "");
+      expect(visible.toLowerCase()).not.toContain("crabbox");
+      expect(visible).not.toContain("WebVNC");
+      return body;
+    };
+    const expectEmbedTicketRequired = async (response: Response): Promise<void> => {
+      await expectEmbedNotice(response, "session-required", 401);
+    };
+
+    // A ticket minted for the embed viewer is worthless at the portal
+    // bootstrap, and trying burns it.
+    const burned = await mintViewerTicket({ embed: true });
+    expect(burned.body).toMatchObject({
+      leaseID: "cbx_000000000001",
+      embed: true,
+      embedContract: "crabbox-webvnc-embed/1",
+    });
+    expect(burned.ticket).toMatch(/^webvnc_view_[a-f0-9]{32}$/);
+    await expectTicketRequired(await bootstrap(portalBootstrapURL, burned.ticket));
+    expect(storage.value(`webvnc-viewer-ticket:${burned.ticket}`)).toBeUndefined();
+    await expectEmbedTicketRequired(await bootstrap(embedBootstrapURL, burned.ticket));
+
+    // The reverse holds for a portal ticket at the embed bootstrap.
+    const portalTicket = await mintViewerTicket({});
+    expect(portalTicket.body).not.toHaveProperty("embed");
+    expect(portalTicket.body).not.toHaveProperty("embedContract");
+    await expectEmbedTicketRequired(await bootstrap(embedBootstrapURL, portalTicket.ticket));
+    await expectTicketRequired(await bootstrap(portalBootstrapURL, portalTicket.ticket));
+
+    // Other bootstrap failures are frameable too, and stay unbranded.
+    const wrongType = await throughCoordinator(
+      new Request(embedBootstrapURL, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: embedOrigin },
+        body: JSON.stringify({ ticket: burned.ticket }),
+      }),
+    );
+    await expectEmbedNotice(wrongType, "unavailable", 415);
+
+    await expect(
+      throughCoordinator(
+        new Request("https://crabbox.test/v1/leases/blue-lobster/webvnc/viewer-bootstrap", {
+          method: "POST",
+          headers: bearerHeaders,
+          body: JSON.stringify({ embed: "yes" }),
+        }),
+      ).then((response) => response.status),
+    ).resolves.toBe(400);
+
+    // The embedding page POSTs the ticket cross-origin; an earlier embed
+    // session cookie must not block it.
+    const minted = await mintViewerTicket({ embed: true, takeControl: true });
+    const staleCookie =
+      "crabbox_webvnc_embed_session=webvnc_session_0123456789abcdef0123456789abcdef";
+    const embedded = await bootstrap(embedBootstrapURL, minted.ticket, { cookie: staleCookie });
+    expect(embedded.status).toBe(200);
+    expect(embedded.headers.get("location")).toBeNull();
+    expect(embedded.headers.get("cache-control")).toBe("no-store");
+    expect(embedded.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(embedded.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    const bootstrapCSP = embedded.headers.get("content-security-policy") ?? "";
+    expect(bootstrapCSP).toContain(`frame-ancestors ${embedOrigin}`);
+    expect(bootstrapCSP).toContain("default-src 'none'");
+    // The embed cookie has its own name and its own path, so it can never
+    // collide with a portal viewer cookie for the same lease, and it ends with
+    // the server session rather than at browser exit.
+    const setCookie = embedded.headers.get("set-cookie") ?? "";
+    expect(setCookie).toMatch(/^crabbox_webvnc_embed_session=webvnc_session_[a-f0-9]{32}; /);
+    expect(setCookie).toContain("Path=/portal/leases/cbx_000000000001/vnc/embed;");
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Secure");
+    expect(setCookie).toContain("SameSite=None");
+    expect(setCookie).toContain("Partitioned");
+    expect(setCookie).not.toContain("SameSite=Strict");
+    expect(setCookie).toMatch(/; Max-Age=(17[89][0-9]|1800)$/);
+    const sessionCookie = setCookie.split(";", 1)[0] ?? "";
+    const sessionValue = sessionCookie.split("=", 2)[1] ?? "";
+    const embeddedBody = await embedded.text();
+    expect(embeddedBody).toContain(
+      'location.replace("/portal/leases/cbx_000000000001/vnc/embed?bootstrapped=1")',
+    );
+    expect(embeddedBody).toContain("<title>Opening desktop</title>");
+    expect(embeddedBody).not.toContain("WebVNC");
+    for (const secret of ["shared-operator-token", minted.ticket, minted.handoff, sessionValue]) {
+      expect(embeddedBody).not.toContain(secret);
+    }
+    await expectEmbedTicketRequired(await bootstrap(embedBootstrapURL, minted.ticket));
+    await expectEmbedTicketRequired(
+      await bootstrap(embedBootstrapURL, minted.ticket, { cookie: sessionCookie }),
+    );
+
+    // The browser refused the partitioned cookie: the marked first load has
+    // no embed cookie, and the frame says so once instead of asking for
+    // another ticket. With the cookie the marked load is the viewer.
+    const refusedCookie = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed?bootstrapped=1"),
+    );
+    const refusedBody = await expectEmbedNotice(refusedCookie, "external-open-required", 401);
+    expect(refusedBody).toContain("new tab");
+    expect(refusedCookie.headers.get("set-cookie")).toBeNull();
+    const markedPage = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed?bootstrapped=1", {
+        headers: { cookie: sessionCookie },
+      }),
+    );
+    expect(markedPage.status).toBe(200);
+    expect(await markedPage.text()).toContain('searchParams.delete("bootstrapped")');
+
+    const page = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed", {
+        headers: { cookie: sessionCookie },
+      }),
+    );
+    expect(page.status).toBe(200);
+    expect(page.headers.get("content-security-policy")).toContain(`frame-ancestors ${embedOrigin}`);
+    expect(page.headers.get("content-security-policy")).not.toContain("frame-ancestors 'none'");
+    const pageBody = await page.text();
+    for (const secret of [
+      "shared-operator-token",
+      minted.ticket,
+      minted.handoff,
+      sessionValue,
+      "vnc-user",
+      "generated-vnc-password",
+    ]) {
+      expect(pageBody).not.toContain(secret);
+    }
+    // No portal chrome: brand, navigation, log out, share, bridge command,
+    // theme toggle or lease metadata bar.
+    expect(pageBody).toContain('class="vnc-page vnc-embed"');
+    expect(pageBody).toContain('class="vnc-bar vnc-embed-bar"');
+    expect(pageBody).not.toContain('class="vnc-meta portal-header-meta"');
+    expect(pageBody).not.toContain('href="/portal"');
+    expect(pageBody).not.toContain('action="/portal/logout"');
+    expect(pageBody).not.toContain('<button id="vnc-share"');
+    expect(pageBody).not.toContain('id="vnc-bridge-cmd"');
+    expect(pageBody).not.toContain('class="icon-btn theme-toggle"');
+    expect(pageBody).not.toContain("crabbox</h1>");
+    expect(pageBody).toContain("<title>Desktop</title>");
+    // No product name or CLI hint in anything the embed surface can show.
+    expect(pageBody).not.toContain("crabbox webvnc status");
+    expect(pageBody).toContain('"bridgeUnavailable":"Desktop unavailable"');
+    expect(pageBody).toContain(
+      '"missingCredentials":"Desktop credentials missing; reopen the desktop"',
+    );
+    expect(pageBody).toContain("Desktop is not running; ask its owner to start it");
+    expect(pageBody).not.toContain("WebVNC daemon not running");
+    // The embed viewer talks only to the embed session routes.
+    expect(pageBody).toContain('"/portal/leases/cbx_000000000001/vnc/embed/viewer"');
+    expect(pageBody).toContain('"/portal/leases/cbx_000000000001/vnc/embed/status"');
+    expect(pageBody).toContain('"/portal/leases/cbx_000000000001/vnc/embed/handoff"');
+    expect(pageBody).not.toContain('"/portal/leases/cbx_000000000001/vnc/viewer"');
+    expect(pageBody).toContain('const embedContract = "crabbox-webvnc-embed/1"');
+    expect(pageBody).toContain("error.sessionRequired = true");
+    // The viewer keeps its own controls, including take control and
+    // fullscreen, and reports only status to the embedding origin.
+    expect(pageBody).toContain('id="vnc-takeover"');
+    expect(pageBody).toContain('id="vnc-fullscreen"');
+    expect(pageBody).toContain('id="vnc-reconnect"');
+    expect(pageBody).toContain("const embedMode = true");
+    expect(pageBody).toContain(`const embedOrigin = ${JSON.stringify(embedOrigin)}`);
+    expect(pageBody).toContain("const takeControlOnConnect = true");
+    expect(pageBody).toContain("const sessionCredentialHandoff = true");
+    expect(pageBody).toContain('const credentialStorageID = "webvnc_credential_');
+    expect(pageBody).toContain("window.parent.postMessage(");
+    expect(pageBody).not.toContain("postMessage(username");
+    expect(pageBody).not.toContain("postMessage(password");
+    const storageID = /const credentialStorageID = "(webvnc_credential_[a-f0-9]+)"/.exec(
+      pageBody,
+    )?.[1];
+    expect(storageID).toBeTruthy();
+    const notifySource = emittedFunction(pageBody, 'function notifyEmbedHost(state, message = "")');
+    expect(notifySource).toContain(", embedOrigin)");
+    expect(notifySource).toContain("contract: embedContract");
+    expect(notifySource).not.toContain('"*"');
+    expect(notifySource).not.toContain("username");
+    expect(notifySource).not.toContain("password");
+
+    // The embed cookie is inert on the portal routes: the portal viewer page
+    // and its session routes never read it.
+    const portalPage = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc", {
+        headers: { cookie: sessionCookie },
+        redirect: "manual",
+      }),
+    );
+    expect(portalPage.status).toBe(302);
+    expect(portalPage.headers.get("location")).toContain("/portal/login");
+    const portalStatus = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/status", {
+        headers: { cookie: sessionCookie },
+        redirect: "manual",
+      }),
+    );
+    expect(portalStatus.status).toBe(302);
+    const share = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/share", {
+        headers: { cookie: sessionCookie },
+      }),
+    );
+    expect(share.status).not.toBe(200);
+
+    // The one-use credential handoff and status stay bound to the session.
+    const credentials = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/handoff", {
+        method: "POST",
+        headers: {
+          cookie: sessionCookie,
+          origin: "https://crabbox.test",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      }),
+    );
+    expect(credentials.status).toBe(200);
+    await expect(credentials.json()).resolves.toEqual({
+      username: "vnc-user",
+      password: "generated-vnc-password",
+    });
+    const credentialReplay = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/handoff", {
+        method: "POST",
+        headers: {
+          cookie: sessionCookie,
+          origin: "https://crabbox.test",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      }),
+    );
+    // A remounted or second frame cannot recover the consumed credentials;
+    // the viewer turns this 401 into one session-required message.
+    expect(credentialReplay.status).toBe(401);
+    const embeddingOriginHandoff = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/handoff", {
+        method: "POST",
+        headers: { cookie: sessionCookie, origin: embedOrigin, "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+    expect(embeddingOriginHandoff.status).toBe(403);
+    const embeddingOriginSocket = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/viewer", {
+        headers: { cookie: sessionCookie, origin: embedOrigin, upgrade: "websocket" },
+      }),
+    );
+    expect(embeddingOriginSocket.status).toBe(403);
+    const status = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/status", {
+        headers: { cookie: sessionCookie },
+      }),
+    );
+    expect(status.status).toBe(200);
+    await expect(status.json()).resolves.toMatchObject({
+      leaseID: "cbx_000000000001",
+      command: "",
+    });
+
+    // A refresh of the frame returns to the same session and the same
+    // credential storage without a new ticket.
+    const refreshed = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed", {
+        headers: { cookie: sessionCookie },
+      }),
+    );
+    expect(refreshed.status).toBe(200);
+    const refreshedBody = await refreshed.text();
+    expect(refreshedBody).toContain(`const credentialStorageID = "${storageID}"`);
+    expect(refreshedBody).not.toContain("generated-vnc-password");
+
+    // Without a session the embed page stays frameable and tells the
+    // embedding origin to mint a fresh ticket instead of redirecting to login.
+    const noSession = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed"),
+    );
+    expect(noSession.status).toBe(401);
+    expect(noSession.headers.get("location")).toBeNull();
+    expect(noSession.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(noSession.headers.get("cache-control")).toBe("no-store");
+    expect(noSession.headers.get("content-security-policy")).toContain(
+      `frame-ancestors ${embedOrigin}`,
+    );
+    const noSessionBody = await noSession.text();
+    expect(noSessionBody).toContain('"state":"session-required"');
+    expect(noSessionBody).toContain('"contract":"crabbox-webvnc-embed/1"');
+    expect(noSessionBody).toContain(`,${JSON.stringify(embedOrigin)})`);
+    expect(noSessionBody).not.toContain("/portal/login");
+    expect(noSessionBody).not.toContain("href=");
+
+    const sessionKey = `webvnc-viewer-session:${sessionValue}`;
+    storage.seed(sessionKey, {
+      ...storage.value<Record<string, unknown>>(sessionKey),
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    const expired = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed", {
+        headers: { cookie: sessionCookie },
+      }),
+    );
+    expect(expired.status).toBe(401);
+    expect(expired.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    const clearCookie = expired.headers.get("set-cookie") ?? "";
+    expect(clearCookie).toContain("crabbox_webvnc_embed_session=;");
+    expect(clearCookie).toContain("Path=/portal/leases/cbx_000000000001/vnc/embed;");
+    expect(clearCookie).toContain("Max-Age=0");
+    expect(clearCookie).toContain("SameSite=None");
+    expect(clearCookie).toContain("Partitioned");
+    expect(await expired.text()).toContain('"state":"session-required"');
+    expect(storage.value(sessionKey)).toBeUndefined();
+    // A session route with the dead cookie answers unframeable JSON that the
+    // viewer turns into session-required, and clears the embed cookie.
+    const expiredStatus = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/status", {
+        headers: { cookie: sessionCookie },
+      }),
+    );
+    expect(expiredStatus.status).toBe(401);
+    expect(expiredStatus.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+    expect(expiredStatus.headers.get("set-cookie")).toContain("crabbox_webvnc_embed_session=;");
+    await expect(expiredStatus.json()).resolves.toMatchObject({
+      error: "webvnc_viewer_session_required",
+    });
+
+    // Browser expiry removes the cookie entirely. The entry gate must still
+    // reach Fleet's non-redirecting 401 on every exact embed session route.
+    await Promise.all(
+      ["", "crabbox_webvnc_embed_session=malformed"].flatMap((cookie) =>
+        [
+          ["status", "GET"],
+          ["handoff", "POST"],
+          ["viewer", "GET"],
+          ["control", "POST"],
+          ["theme", "POST"],
+        ].map(async ([endpoint, method]) => {
+          const missing = await throughCoordinator(
+            new Request(
+              `https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/${endpoint}`,
+              {
+                method,
+                headers: {
+                  cookie,
+                  origin: "https://crabbox.test",
+                  ...(endpoint === "viewer" ? { upgrade: "websocket" } : {}),
+                },
+              },
+            ),
+          );
+          expect(missing.status).toBe(401);
+          expect(missing.headers.get("location")).toBeNull();
+          expect(missing.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+          await expect(missing.json()).resolves.toEqual({
+            error: "webvnc_viewer_session_required",
+            message: "desktop session required",
+          });
+        }),
+      ),
+    );
+
+    // A lease deleted after minting fails closed at the bootstrap.
+    const late = await mintViewerTicket({ embed: true });
+    await storage.delete("lease:cbx_000000000001");
+    await expectEmbedTicketRequired(await bootstrap(embedBootstrapURL, late.ticket));
+    expect(storage.value(`webvnc-viewer-ticket:${late.ticket}`)).toBeUndefined();
+  });
+
+  it("refuses the embedded WebVNC viewer when no embed origin is configured", async () => {
+    const storage = new MemoryStorage();
+    const env = {
+      CRABBOX_SHARED_TOKEN: "shared-operator-token",
+      CRABBOX_SHARED_OWNER: "automation@example.com",
+      CRABBOX_DEFAULT_ORG: "example-org",
+      CRABBOX_PUBLIC_URL: "https://crabbox.test",
+      CRABBOX_WEBVNC_EMBED_ORIGIN: "https://bb.example.test/panel",
+    } as Env;
+    const fleet = new FleetDurableObject({ storage } as unknown as DurableObjectState, env);
+    storage.seed(
+      "lease:cbx_000000000001",
+      testLease({
+        id: "cbx_000000000001",
+        slug: "blue-lobster",
+        owner: "automation@example.com",
+        org: "example-org",
+        desktop: true,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      }),
+    );
+    const throughCoordinator = async (input: Request): Promise<Response> =>
+      await routeCoordinatorRequest(input, env, async (prepared) => await fleet.fetch(prepared));
+    const bearerHeaders = {
+      authorization: "Bearer shared-operator-token",
+      "content-type": "application/json",
+    };
+
+    const refused = await throughCoordinator(
+      new Request("https://crabbox.test/v1/leases/blue-lobster/webvnc/viewer-bootstrap", {
+        method: "POST",
+        headers: bearerHeaders,
+        body: JSON.stringify({ embed: true }),
+      }),
+    );
+    expect(refused.status).toBe(409);
+    await expect(refused.json()).resolves.toMatchObject({ error: "webvnc_embed_unavailable" });
+    await expect(storage.list({ prefix: "webvnc-viewer-ticket:" })).resolves.toHaveProperty(
+      "size",
+      0,
+    );
+
+    const issued = await throughCoordinator(
+      new Request("https://crabbox.test/v1/leases/blue-lobster/webvnc/viewer-bootstrap", {
+        method: "POST",
+        headers: bearerHeaders,
+        body: JSON.stringify({ embed: false }),
+      }),
+    );
+    expect(issued.status).toBe(200);
+    const { ticket } = (await issued.json()) as { ticket: string };
+
+    const embedBootstrap = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/bootstrap", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ ticket }),
+      }),
+    );
+    expect(embedBootstrap.status).toBe(404);
+    // The refused bootstrap did not consume the portal ticket.
+    expect(storage.value(`webvnc-viewer-ticket:${ticket}`)).toBeDefined();
+
+    const embedPage = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed"),
+    );
+    expect(embedPage.status).toBe(404);
+
+    const portalBootstrap = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/bootstrap", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ ticket }),
+      }),
+    );
+    expect(portalBootstrap.status).toBe(200);
+    expect(portalBootstrap.headers.get("content-security-policy")).toContain(
+      "frame-ancestors 'none'",
+    );
+    const cookie = (portalBootstrap.headers.get("set-cookie") ?? "").split(";", 1)[0] ?? "";
+    expect(portalBootstrap.headers.get("set-cookie")).toContain("SameSite=Strict");
+    const portalPage = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc", {
+        headers: { cookie },
+      }),
+    );
+    expect(portalPage.status).toBe(200);
+    expect(portalPage.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    const portalBody = await portalPage.text();
+    expect(portalBody).toContain("const embedMode = false");
+    expect(portalBody).toContain('class="vnc-meta portal-header-meta"');
+    // A portal session never opens the embed viewer either.
+    const crossed = await throughCoordinator(
+      new Request("https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed", {
+        headers: { cookie },
+      }),
+    );
+    expect(crossed.status).toBe(404);
+  });
+
+  it("keeps embed and portal viewer sessions for one lease apart in one browser", async () => {
+    // Same-site embedding (bb.example.test framing crabbox.example.test) sends
+    // the portal viewer cookie into the frame and the partitioned embed cookie
+    // on top-level portal navigations. Distinct names, paths and readers keep
+    // both viewers working with both cookies present.
+    const storage = new MemoryStorage();
+    const embedOrigin = "https://bb.example.test";
+    const env = {
+      CRABBOX_SHARED_TOKEN: "shared-operator-token",
+      CRABBOX_SHARED_OWNER: "automation@example.com",
+      CRABBOX_DEFAULT_ORG: "example-org",
+      CRABBOX_PUBLIC_URL: "https://crabbox.example.test",
+      CRABBOX_WEBVNC_EMBED_ORIGIN: embedOrigin,
+    } as Env;
+    const fleet = new FleetDurableObject({ storage } as unknown as DurableObjectState, env);
+    storage.seed(
+      "lease:cbx_000000000001",
+      testLease({
+        id: "cbx_000000000001",
+        slug: "blue-lobster",
+        owner: "automation@example.com",
+        org: "example-org",
+        desktop: true,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      }),
+    );
+    const throughCoordinator = async (input: Request): Promise<Response> =>
+      await routeCoordinatorRequest(input, env, async (prepared) => await fleet.fetch(prepared));
+    const base = "https://crabbox.example.test/portal/leases/cbx_000000000001/vnc";
+    const mint = async (body: Record<string, unknown>): Promise<string> => {
+      const issued = await throughCoordinator(
+        new Request("https://crabbox.example.test/v1/leases/blue-lobster/webvnc/viewer-bootstrap", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer shared-operator-token",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        }),
+      );
+      expect(issued.status).toBe(200);
+      return ((await issued.json()) as { ticket: string }).ticket;
+    };
+    const bootstrap = async (url: string, ticket: string): Promise<string> => {
+      const response = await throughCoordinator(
+        new Request(url, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ ticket }),
+        }),
+      );
+      expect(response.status).toBe(200);
+      return (response.headers.get("set-cookie") ?? "").split(";", 1)[0] ?? "";
+    };
+
+    const portalCookie = await bootstrap(`${base}/bootstrap`, await mint({}));
+    const embedCookie = await bootstrap(`${base}/embed/bootstrap`, await mint({ embed: true }));
+    expect(portalCookie).toMatch(/^crabbox_webvnc_session=webvnc_session_/);
+    expect(embedCookie).toMatch(/^crabbox_webvnc_embed_session=webvnc_session_/);
+    const both = `${portalCookie}; ${embedCookie}`;
+    const bothReversed = `${embedCookie}; ${portalCookie}`;
+
+    const bothViewersWork = async (cookie: string): Promise<void> => {
+      const portalPage = await throughCoordinator(new Request(base, { headers: { cookie } }));
+      expect(portalPage.status).toBe(200);
+      expect(portalPage.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      expect(await portalPage.text()).toContain("const embedMode = false");
+      const embedPage = await throughCoordinator(
+        new Request(`${base}/embed`, { headers: { cookie } }),
+      );
+      expect(embedPage.status).toBe(200);
+      expect(embedPage.headers.get("content-security-policy")).toContain(
+        `frame-ancestors ${embedOrigin}`,
+      );
+      expect(await embedPage.text()).toContain("const embedMode = true");
+      const statuses = await Promise.all(
+        [`${base}/status`, `${base}/embed/status`].map(async (url) => ({
+          url,
+          status: (await throughCoordinator(new Request(url, { headers: { cookie } }))).status,
+        })),
+      );
+      expect(statuses).toEqual(statuses.map(({ url }) => ({ url, status: 200 })));
+    };
+    await bothViewersWork(both);
+    await bothViewersWork(bothReversed);
+
+    // Each cookie is inert on the other mode's routes and clearing one never
+    // touches the other.
+    const portalOnlyEmbed = await throughCoordinator(
+      new Request(`${base}/embed`, { headers: { cookie: portalCookie } }),
+    );
+    expect(portalOnlyEmbed.status).toBe(401);
+    expect(await portalOnlyEmbed.text()).toContain('"state":"session-required"');
+    const clears = portalOnlyEmbed.headers.get("set-cookie") ?? "";
+    expect(clears).toContain("crabbox_webvnc_embed_session=;");
+    expect(clears).not.toContain("crabbox_webvnc_session=;");
+    const embedOnlyPortal = await throughCoordinator(
+      new Request(base, { headers: { cookie: embedCookie }, redirect: "manual" }),
+    );
+    expect(embedOnlyPortal.status).toBe(302);
+    expect(embedOnlyPortal.headers.get("set-cookie")).toBeNull();
+    // Both sessions still exist afterwards.
+    const stillPortal = await throughCoordinator(
+      new Request(base, { headers: { cookie: portalCookie } }),
+    );
+    expect(stillPortal.status).toBe(200);
+    const stillEmbed = await throughCoordinator(
+      new Request(`${base}/embed`, { headers: { cookie: embedCookie } }),
+    );
+    expect(stillEmbed.status).toBe(200);
   });
 
   it("serializes the bearer viewer session deadline into the WebVNC socket attachment", async () => {
@@ -38953,7 +39637,7 @@ describe("fleet lease identity and idle", () => {
     expect(pageBody).not.toContain("status-pill vnc-role");
     expect(pageBody).toContain("rfb.viewOnly = !controlling");
     expect(pageBody).toContain("state?.terminal");
-    expect(pageBody).toContain("stopPolling(state.message");
+    expect(pageBody).toContain("stopPolling(terminalMessage)");
     expect(pageBody).toContain('fragment.get("username")');
     expect(pageBody).toContain('types.includes("username")');
     expect(pageBody).toContain("VNC credentials missing; open WebVNC from crabbox webvnc status");

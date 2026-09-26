@@ -396,12 +396,45 @@ require an exact same-origin browser `Origin` matching `CRABBOX_PUBLIC_URL` (or
 the request origin when no public URL is configured). Missing or sibling-origin
 intent is rejected before the portal cookie is converted into bearer authority;
 explicit bearer API clients remain independent of this browser-only boundary.
-The one-use WebVNC bootstrap POST is the narrow exception: it may arrive from
-the CLI's file-origin bootstrap page or another application's page, including
-with a viewer cookie left by an earlier open, and it authorizes only by
-consuming the opaque, lease-bound ticket, which also replaces that cookie.
-Subsequent scoped-cookie mutations and viewer upgrades return to the exact
-same-origin requirement.
+The one-use WebVNC bootstrap POSTs, portal and embed, are the narrow exception:
+they may arrive from the CLI's file-origin bootstrap page or another
+application's page, including with a viewer cookie left by an earlier open,
+and each authorizes only by consuming the opaque, lease-bound ticket, which
+also replaces that cookie. Subsequent scoped-cookie mutations and viewer
+upgrades return to the exact same-origin requirement.
+
+Every portal page answers with `frame-ancestors 'none'`. Only the embedded
+WebVNC viewer under `/vnc/embed` may be framed, only by the single origin in
+`CRABBOX_WEBVNC_EMBED_ORIGIN`, and only through a ticket minted with
+`embed: true`. Its session cookie `crabbox_webvnc_embed_session` is
+`SameSite=None; Partitioned` with an explicit `Max-Age`, lives on the
+`/vnc/embed` path and is read only by the embed routes, while the portal
+viewer's `crabbox_webvnc_session` stays `SameSite=Strict` on `/vnc` and is
+read only by the portal routes. When the embedding site and the coordinator
+are same-site both cookies can reach the embed routes; the narrower embed
+cookie path excludes the portal viewer. Separate names and readers keep
+each session bound to its own viewer. Same-lease embed frames share their
+cookie; separate leases use separate cookie paths.
+
+When embed mode is enabled, bootstrap and viewer-page failures are frameable
+HTML notices. Disabled mode returns an unframeable 404. Exact embed session
+routes return non-redirecting 401 JSON with `frame-ancestors 'none'` when the
+browser session is missing or invalid, even when the browser has removed an
+expired cookie. Admission to that handler grants no authentication. The
+viewer stops and posts `session-required` once, including during connected
+polling. Terminal handoff failures stop with `unavailable`; transient
+failures have a 5-retry limit and handoff requests time out after 10 seconds.
+
+The frame posts only `{type, contract, leaseID, state, message}` to the
+configured origin, never credentials or tickets. The parent must check the
+sender origin, its own iframe's `contentWindow`, and the exact type and
+contract, and separately bound automatic ticket remints. Cookie refusal on
+the marked first load sends `external-open-required` for a user-driven
+new-tab fallback, not another embed mint. Cookie-bearing mutations and
+WebSocket upgrades require the coordinator origin. Safe GETs may arrive
+cross-origin, but their responses have no readable CORS permission. The
+embedding page cannot read the HttpOnly cookie, desktop credentials or the
+frame's cross-origin history.
 Portal logout follows the same boundary: `GET /portal/logout` only renders a
 confirmation page, and only a same-origin `POST` clears the portal cookie and
 revokes all WebVNC, Code, and mediated-egress bridges bound to that portal
