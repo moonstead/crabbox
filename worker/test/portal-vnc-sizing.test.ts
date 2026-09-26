@@ -49,13 +49,19 @@ async function viewer(
   target: TargetOS = "linux",
   desktopEnv = "wayland",
   initialStatus?: () => Promise<State>,
+  embed?: { handoffStatus?: number | "network" | "stall" },
 ) {
-  const page = await portalVNC({
-    id: "cbx_sizing",
-    provider: "hetzner",
-    target,
-    desktopEnv,
-  } as LeaseRecord).text();
+  const page = await portalVNC(
+    { id: "cbx_sizing", provider: "hetzner", target, desktopEnv } as LeaseRecord,
+    embed
+      ? {
+          viewerOnly: true,
+          sessionCredentialHandoff: true,
+          sessionCredentialStorageID: "test-credentials",
+          embed: { origin: "https://bb.example.test", frameAncestors: "https://bb.example.test" },
+        }
+      : {},
+  ).text();
   const script = [...page.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\b[^>]*>/gi)]
     .map((match) => match[1]!)
     .find((body) => body.includes("import RFBModule"))!
@@ -101,6 +107,9 @@ async function viewer(
   let controlReply: (() => Promise<State>) | undefined;
   let controlFetch: (() => Promise<void>) | undefined;
   let controlCalls = 0;
+  let handoffCalls = 0;
+  let statusCode = 200;
+  const messages: { payload: { state: string }; origin: string }[] = [];
   const intervals = new Map<number, () => unknown>();
   const timeouts = new Map<number, { callback: () => unknown; delay: number }>();
   const signals: AbortSignal[] = [];
@@ -123,7 +132,11 @@ async function viewer(
         protocol: "https:",
         hash: "",
       },
-      history: { state: null },
+      history: { state: null, replaceState() {} },
+      parent: {
+        postMessage: (payload: { state: string }, origin: string) =>
+          messages.push({ payload, origin }),
+      },
       addEventListener() {},
       clearTimeout: (id: number) => timeouts.delete(id),
       setTimeout: (callback: () => unknown, delay: number) => {
@@ -139,6 +152,16 @@ async function viewer(
     fetch: async (url: URL, options?: { signal?: AbortSignal }) => {
       const signal = options?.signal;
       if (signal) signals.push(signal);
+      if (url.pathname.endsWith("/handoff")) {
+        handoffCalls++;
+        if (embed?.handoffStatus === "network") throw new TypeError("Failed to fetch");
+        if (embed?.handoffStatus === "stall")
+          return abortable<Response>(() => new Promise(() => {}), signal);
+        return Response.json(
+          { username: "test-user", password: "test-password" },
+          { status: embed?.handoffStatus ?? 200 },
+        );
+      }
       if (url.pathname.endsWith("/control")) {
         controlCalls++;
         await abortable(async () => controlFetch?.(), signal);
@@ -153,6 +176,8 @@ async function viewer(
         };
       }
       await abortable(async () => statusFetch?.(), signal);
+      if (statusCode !== 200)
+        return Response.json({ error: "session-required" }, { status: statusCode });
       return {
         ok: true,
         json: () =>
@@ -191,6 +216,20 @@ async function viewer(
     },
     controlCalls: () => controlCalls,
     signals,
+    messages,
+    handoffCalls: () => handoffCalls,
+    setStatusCode: (code: number) => {
+      statusCode = code;
+    },
+    pendingTimers: () => timeouts.size + intervals.size,
+    retry: async () => {
+      // eslint-disable-next-line unicorn/no-useless-spread -- callbacks can register new timers; fire only this tick's snapshot
+      for (const [id, timer] of [...timeouts]) {
+        timeouts.delete(id);
+        timer.callback();
+      }
+      await settle();
+    },
     expireRequests: async () => {
       for (const [id, timer] of timeouts) {
         if (timer.delay !== 10000) continue;
@@ -460,4 +499,81 @@ describe("emitted WebVNC sizing policy", () => {
     expect(v.elements.get("status")!.textContent).toBe("connected");
     expect(v.controlCalls()).toBe(1);
   });
+});
+
+describe("emitted embed recovery script", () => {
+  it("stops connected polling once when the cookie disappears or the session expires", async () => {
+    const v = await viewer("linux", "wayland", undefined, {});
+    await v.connect();
+    expect(v.handoffCalls()).toBe(1);
+    v.setStatusCode(401);
+    await v.poll();
+    await v.poll();
+    await v.clients[0]!.fire("disconnect");
+    await v.retry();
+    expect(v.messages.map(({ payload }) => payload.state)).toEqual([
+      "connected",
+      "session-required",
+    ]);
+    expect(v.messages.at(-1)).toEqual({
+      origin: "https://bb.example.test",
+      payload: {
+        type: "crabbox-webvnc-embed",
+        contract: "crabbox-webvnc-embed/1",
+        leaseID: "cbx_sizing",
+        state: "session-required",
+        message: "Desktop session ended",
+      },
+    });
+    expect(v.pendingTimers()).toBe(0);
+    expect(v.clients).toHaveLength(1);
+  });
+
+  it("requests a session once for a cold remount with consumed credentials", async () => {
+    const v = await viewer("linux", "wayland", undefined, { handoffStatus: 401 });
+    await v.retry();
+    expect(v.handoffCalls()).toBe(1);
+    expect(v.messages.map(({ payload }) => payload.state)).toEqual(["session-required"]);
+    expect(v.pendingTimers()).toBe(0);
+  });
+
+  it.each([400, 403, 404, 409, 410, 422])(
+    "stops when the page-to-handoff lease race answers %s",
+    async (handoffStatus) => {
+      const v = await viewer("linux", "wayland", undefined, { handoffStatus });
+      await v.retry();
+      expect(v.handoffCalls()).toBe(1);
+      expect(v.messages.map(({ payload }) => payload.state)).toEqual(["unavailable"]);
+      expect(v.pendingTimers()).toBe(0);
+      expect(v.clients).toHaveLength(0);
+    },
+  );
+
+  it("times out stalled handoff transport and exhausts its retry budget", async () => {
+    const v = await viewer("linux", "wayland", undefined, { handoffStatus: "stall" });
+    for (let attempt = 0; attempt < 6; attempt++) {
+      // eslint-disable-next-line no-await-in-loop -- each retry starts only after the preceding timeout
+      await v.expireRequests();
+      // eslint-disable-next-line no-await-in-loop -- advance the next attempt, not concurrent connections
+      await v.retry();
+    }
+    expect(v.handoffCalls()).toBe(6);
+    expect(v.messages.map(({ payload }) => payload.state)).toEqual(["unavailable"]);
+    expect(v.pendingTimers()).toBe(0);
+  });
+
+  it.each([408, 429, 500, 503, "network"] as const)(
+    "bounds transient handoff retries for %s",
+    async (handoffStatus) => {
+      const v = await viewer("linux", "wayland", undefined, { handoffStatus });
+      // eslint-disable-next-line no-await-in-loop -- retry attempts are sequential timer ticks
+      for (let attempt = 0; attempt < 8; attempt++) await v.retry();
+      expect(v.handoffCalls()).toBe(6);
+      expect(v.messages.map(({ payload }) => payload.state)).toEqual(["unavailable"]);
+      expect(v.pendingTimers()).toBe(0);
+      await v.reconnect();
+      expect(v.handoffCalls()).toBe(7);
+      expect(v.pendingTimers()).toBe(1);
+    },
+  );
 });

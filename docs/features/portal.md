@@ -162,16 +162,25 @@ The contract is the ticket flow above with `embed: true`:
    session's 30-minute lifetime, the lease, the grant or the token behind it
    ends.
 
-Every embed response, success or failure, is HTML with
-`frame-ancestors <configured origin>` and a status message; the embed
-bootstrap never answers JSON. Every portal response keeps
-`frame-ancestors 'none'`, and the few JSON answers on embed session routes
-carry `frame-ancestors 'none'` too. The embed session opens nothing in the
-portal shell, a portal session opens nothing in the embed viewer, and
-embedded viewers never hand a session to another tab. Status, control,
-theme, handoff and the viewer WebSocket still require the coordinator's own
-origin, so the embedding page cannot call them, and it cannot read the
-cookie, the desktop credentials or the frame's history.
+When embed mode is enabled, the bootstrap and viewer page return HTML with
+`frame-ancestors <configured origin>`. Bootstrap failures and unavailable
+viewer pages include a status message for the parent. Disabled embed mode
+returns an unframeable 404. Other portal pages keep `frame-ancestors 'none'`.
+The embed session opens nothing in the portal shell, a portal session opens
+nothing in the embed viewer, and embedded viewers never hand a session to
+another tab.
+
+Embed session endpoints return JSON or a WebSocket upgrade, not viewer HTML.
+On the exact `/vnc/embed/{status,control,theme,handoff,viewer}` routes, a
+missing, malformed or expired browser session gets a non-redirecting 401
+JSON response with `frame-ancestors 'none'`, never the portal login page.
+Reaching this handler grants no authentication. The frame turns that 401
+into a single `session-required` signal, including during connected polling.
+Cookie-bearing mutations and WebSocket upgrades require the coordinator's
+own origin. Cross-origin safe GETs can reach the coordinator, but the browser
+prevents the embedding page from reading their responses. It also prevents
+that page from reading the HttpOnly cookie, desktop credentials or frame
+history.
 
 The frame reports status only. The notice and the viewer post
 `{type: "crabbox-webvnc-embed", contract: "crabbox-webvnc-embed/1", leaseID,
@@ -181,17 +190,34 @@ target. `state` is one of:
 - `session-required`: no valid session, an expired or burned ticket at the
   bootstrap, or a frame that cannot recover its one-use desktop credentials
   (a frame element that was recreated, or a second frame for the same lease
-  whose bootstrap replaced the shared cookie). The frame stops, posts this
-  once and never retries; the application mints a new ticket and repeats
-  step 2. Nothing in the message lets it do so by itself.
+  whose bootstrap replaced the shared cookie). The frame stops and posts
+  this once per connection attempt. The application may mint a fresh ticket
+  and repeat step 2, with its own limit on automatic remints. Same-lease
+  frames share a cookie, so a cold remount should always use a fresh ticket.
+  Nothing in the message lets the frame mint a ticket by itself.
 - `external-open-required`: the bootstrap set the cookie but the marked first
   load of the viewer arrived without it, so this browser refuses partitioned
   cross-site cookies. The frame posts this once; the application should open
   the desktop in a new tab through the portal ticket flow instead of minting
   another embed ticket.
 - `unavailable`: the lease is not active, has no desktop or is not visible;
-  also the answer to a malformed bootstrap request.
+  also the answer to a malformed bootstrap request, a terminal handoff
+  failure, or exhaustion of the viewer's retry budget
 - `connected` and `disconnected`: the viewer's VNC connection state.
+
+The viewer stops on handoff 401 with `session-required`. Other handoff 4xx
+responses stop with `unavailable`, except 408 and 429. Network failures,
+timeouts, 408, 429 and server failures can retry at most 5 times after the
+initial attempt. Each handoff request has a 10-second timeout. Exhausting
+that budget stops the viewer and sends `unavailable`; manual Reconnect
+starts a new budget. An established connection also resets the budget.
+
+The parent must check both `event.origin` and
+`event.source === iframe.contentWindow`, then the exact message type and
+contract. Messages from another Desktop frame must not trigger a remint.
+The parent should bound automatic remints separately and offer one
+user-driven new-tab fallback on `external-open-required`, rather than
+retrying embeds or opening repeated popups.
 
 Take control stays inside the authenticated viewer session, through
 `takeControl` at minting and the viewer's own button. This is where later

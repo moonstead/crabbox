@@ -1282,18 +1282,22 @@ export function portalVNC(
       }
       async function loadHandoffCredentials() {
         if (credentialsReady) return;
-        const response = await fetch(handoffURL, {
-          method: "POST",
-          headers: { "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify(handoffTicket ? { ticket: handoffTicket } : {}),
+        const { response, body } = await collaborationOperation(async (signal) => {
+          const response = await fetch(handoffURL, {
+            method: "POST",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            body: JSON.stringify(handoffTicket ? { ticket: handoffTicket } : {}),
+            signal,
+          });
+          return { response, body: await response.json().catch(() => ({})) };
         });
-        const body = await response.json().catch(() => ({}));
         if (!response.ok) {
-          const error = new Error(detail(body.message || body.error, embedMode ? words.sessionExpired : "VNC handoff failed"));
+          const error = new Error(detail(body.message || body.error, embedMode ? (response.status === 401 ? words.sessionExpired : words.bridgeUnavailable) : "VNC handoff failed"));
           // The one-use credentials were already consumed by an earlier
           // navigation of this session (a remounted or second frame). No
           // retry can recover them; the embedding origin must mint again.
           if (embedMode && response.status === 401) error.sessionRequired = true;
+          if (embedMode && response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status)) error.unavailable = true;
           throw error;
         }
         username = typeof body.username === "string" ? body.username : "";
@@ -1618,6 +1622,10 @@ export function portalVNC(
         try {
           const state = await bridgeState();
           if (!connected || epoch !== connectionEpoch || request !== collaborationRequest) return;
+          if (embedMode && state?.terminal) {
+            stopEmbed(state.sessionRequired ? "session-required" : "unavailable", state.sessionRequired ? words.sessionExpired : words.bridgeUnavailable);
+            return;
+          }
           applyCollaborationState(state);
           return state;
         } finally {
@@ -1704,8 +1712,19 @@ export function portalVNC(
         screen.replaceChildren();
         setStatus(label, "bad");
       }
+      function stopEmbed(state, message) {
+        if (stopped) return;
+        stopPolling(message);
+        notifyEmbedHost(state, message);
+      }
       function scheduleRetry(label) {
         if (stopped) return;
+        // ponytail: five consecutive automatic retries per connection attempt;
+        // manual Reconnect starts a new budget, not an unbounded remint loop.
+        if (embedMode && retryAttempt >= 5) {
+          stopEmbed("unavailable", words.bridgeUnavailable);
+          return;
+        }
         const delay = retryDelay();
         retryAttempt += 1;
         setStatus(label + "; retrying in " + Math.ceil(delay / 1000) + "s", "warn");
@@ -1728,8 +1747,8 @@ export function portalVNC(
           if (state?.controllerID) controllerID = state.controllerID;
           if (state?.terminal) {
             const terminalMessage = state.sessionRequired ? words.sessionExpired : detail(state.message, words.bridgeUnavailable);
-            stopPolling(terminalMessage);
-            notifyEmbedHost(state.sessionRequired ? "session-required" : "unavailable", terminalMessage);
+            if (embedMode) stopEmbed(state.sessionRequired ? "session-required" : "unavailable", terminalMessage);
+            else stopPolling(terminalMessage);
             return;
           }
           if (state?.transient) {
@@ -1827,9 +1846,8 @@ export function portalVNC(
           });
         } catch (error) {
           if (!current()) return;
-          if (embedMode && error?.sessionRequired) {
-            stopPolling(words.sessionExpired);
-            notifyEmbedHost("session-required", words.sessionExpired);
+          if (embedMode && (error?.sessionRequired || error?.unavailable)) {
+            stopEmbed(error.sessionRequired ? "session-required" : "unavailable", error.sessionRequired ? words.sessionExpired : words.bridgeUnavailable);
             return;
           }
           scheduleRetry(error instanceof Error ? error.message : String(error));

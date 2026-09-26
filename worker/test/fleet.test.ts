@@ -38179,6 +38179,8 @@ describe("fleet lease identity and idle", () => {
       },
     };
     const reloadContext = createContext({
+      collaborationOperation: (operation: (signal: AbortSignal) => Promise<unknown>) =>
+        operation(new AbortController().signal),
       fetch: vi.fn<() => Promise<Response>>(
         async () =>
           new Response(
@@ -38923,7 +38925,42 @@ describe("fleet lease identity and idle", () => {
       error: "webvnc_viewer_session_required",
     });
 
-    // A lease released after minting fails closed at the bootstrap.
+    // Browser expiry removes the cookie entirely. The entry gate must still
+    // reach Fleet's non-redirecting 401 on every exact embed session route.
+    await Promise.all(
+      ["", "crabbox_webvnc_embed_session=malformed"].flatMap((cookie) =>
+        [
+          ["status", "GET"],
+          ["handoff", "POST"],
+          ["viewer", "GET"],
+          ["control", "POST"],
+          ["theme", "POST"],
+        ].map(async ([endpoint, method]) => {
+          const missing = await throughCoordinator(
+            new Request(
+              `https://crabbox.test/portal/leases/cbx_000000000001/vnc/embed/${endpoint}`,
+              {
+                method,
+                headers: {
+                  cookie,
+                  origin: "https://crabbox.test",
+                  ...(endpoint === "viewer" ? { upgrade: "websocket" } : {}),
+                },
+              },
+            ),
+          );
+          expect(missing.status).toBe(401);
+          expect(missing.headers.get("location")).toBeNull();
+          expect(missing.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+          await expect(missing.json()).resolves.toEqual({
+            error: "webvnc_viewer_session_required",
+            message: "desktop session required",
+          });
+        }),
+      ),
+    );
+
+    // A lease deleted after minting fails closed at the bootstrap.
     const late = await mintViewerTicket({ embed: true });
     await storage.delete("lease:cbx_000000000001");
     await expectEmbedTicketRequired(await bootstrap(embedBootstrapURL, late.ticket));

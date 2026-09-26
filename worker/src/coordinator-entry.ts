@@ -316,13 +316,11 @@ function isWebVNCViewerSessionRequest(request: Request, url: URL): boolean {
     /^\/portal\/leases\/[^/]+\/vnc(?:\/(?:status|control|theme|handoff|viewer))?$/.test(
       url.pathname,
     );
-  if (!embedRoute && !portalRoute) {
-    return false;
-  }
-  const session = cookieValue(
-    cookie,
-    embedRoute ? webVNCEmbedSessionCookieName : webVNCPortalSessionCookieName,
-  );
+  // Admission is not authentication: Fleet validates the embed session. A
+  // missing cookie must reach its 401 handler, never the portal login route.
+  if (embedRoute) return true;
+  if (!portalRoute) return false;
+  const session = cookieValue(cookie, webVNCPortalSessionCookieName);
   return /^webvnc_session_[a-f0-9]{32}$/.test(session);
 }
 

@@ -333,7 +333,7 @@ describe("coordinator auth", () => {
     const nearMisses = [
       "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed/",
       "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embedx",
-      "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed/status",
+      "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed/status/",
     ];
     const nearMissResults = await Promise.all(
       nearMisses.map(async (url) => ({
@@ -348,8 +348,9 @@ describe("coordinator auth", () => {
       });
     }
 
-    // Embed session routes admit only the embed cookie; portal session routes
-    // admit only the portal cookie. Each cookie is inert on the other side.
+    // Embed routes reach Fleet even without a cookie: admission grants no
+    // identity, and Fleet answers session-required rather than a login redirect.
+    // Portal routes still require their own cookie at this gate.
     const embedCookie =
       "crabbox_webvnc_embed_session=webvnc_session_0123456789abcdef0123456789abcdef";
     const embedBase = "https://broker.example.test/portal/leases/cbx_000000000001/vnc/embed";
@@ -373,10 +374,38 @@ describe("coordinator auth", () => {
       }
       expect(prepared.request.headers.has("x-crabbox-owner")).toBe(false);
     }
+    await Promise.all(
+      ["", sessionCookie, "crabbox_webvnc_embed_session=malformed"].flatMap((cookie) =>
+        [
+          ["status", "GET"],
+          ["handoff", "POST"],
+          ["viewer", "GET"],
+          ["control", "POST"],
+          ["theme", "POST"],
+        ].map(async ([endpoint, method]) => {
+          const prepared = await prepareCoordinatorRequest(
+            new Request(`${embedBase}/${endpoint}`, {
+              method,
+              headers: {
+                cookie,
+                origin: "https://broker.example.test",
+                "x-crabbox-auth": "admin",
+                "x-crabbox-owner": "forged@example.test",
+                ...(endpoint === "viewer" ? { upgrade: "websocket" } : {}),
+              },
+            }),
+            env,
+          );
+          expect(prepared.authenticated).toBe(false);
+          if ("response" in prepared)
+            throw new Error(`unexpected login or auth response for ${endpoint}`);
+          expect(prepared.request.headers.has("x-crabbox-auth")).toBe(false);
+          expect(prepared.request.headers.has("x-crabbox-owner")).toBe(false);
+        }),
+      ),
+    );
     const crossed = await Promise.all(
       [
-        [`${embedBase}/status`, sessionCookie],
-        [`${embedBase}/viewer`, sessionCookie],
         ["https://broker.example.test/portal/leases/cbx_000000000001/vnc/status", embedCookie],
         ["https://broker.example.test/portal/leases/cbx_000000000001/vnc", embedCookie],
         [
