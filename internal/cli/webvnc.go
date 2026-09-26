@@ -2830,6 +2830,9 @@ type webVNCBridge struct {
 	log                   io.Writer
 	desktopThemeUpdates   chan string
 	applyDesktopThemeFunc func(context.Context, string) error
+	// inputGate is set when the guest fronts its VNC server with an input
+	// gate; see webvnc_input_gate.go.
+	inputGate bool
 }
 
 const webVNCDesktopThemeSSHAttemptTimeout = 35 * time.Second
@@ -2852,12 +2855,24 @@ func connectWebVNCBridgeWithDial(ctx context.Context, coord *CoordinatorClient, 
 	if err != nil {
 		return nil, err
 	}
+	inputGate := false
+	if _, relay := tcp.(*wayVNCRelayConn); !relay && (target.TargetOS == "" || target.TargetOS == targetLinux) {
+		detected, gate, detectErr := detectWebVNCInputGate(tcp, webVNCInputGateDetectTimeout)
+		if detectErr != nil {
+			_ = tcp.Close()
+			return nil, detectErr
+		}
+		tcp, inputGate = detected, gate
+	}
 	ticket, err := coord.CreateWebVNCTicket(ctx, leaseID)
 	if err != nil {
 		_ = tcp.Close()
 		return nil, err
 	}
 	capabilities := webVNCBridgeCapabilities(ctx, target)
+	if inputGate {
+		capabilities = withInputGateCapability(capabilities)
+	}
 	splitAgentOrigin := !sameWebVNCOrigin(agentBaseURL, coord.BaseURL)
 	var headers http.Header
 	if splitAgentOrigin {
@@ -2906,6 +2921,7 @@ func connectWebVNCBridgeWithDial(ctx context.Context, coord *CoordinatorClient, 
 		authenticationMode:  authMode,
 		log:                 log,
 		desktopThemeUpdates: make(chan string, 1),
+		inputGate:           inputGate,
 	}, nil
 }
 
@@ -3056,7 +3072,11 @@ func (b *webVNCBridge) Serve(ctx context.Context) error {
 	}
 	errc := make(chan error, 2)
 	go func() { errc <- b.copyWebSocketToTCP(ctx) }()
-	go func() { errc <- copyTCPToWebSocket(ctx, b.ws, b.tcp) }()
+	if b.inputGate {
+		go func() { errc <- copyInputGateToWebSocket(ctx, b.ws, b.tcp) }()
+	} else {
+		go func() { errc <- copyTCPToWebSocket(ctx, b.ws, b.tcp) }()
+	}
 	select {
 	case <-ctx.Done():
 		return context.Cause(ctx)
@@ -4312,6 +4332,19 @@ func (b *webVNCBridge) copyWebSocketToTCP(ctx context.Context) error {
 			if handled {
 				continue
 			}
+			gateMessage, err := b.forwardInputGateText(data)
+			if err != nil {
+				return err
+			}
+			if gateMessage {
+				continue
+			}
+		}
+		if b.inputGate {
+			if err := writeInputGateData(b.tcp, data); err != nil {
+				return err
+			}
+			continue
 		}
 		if _, err := b.tcp.Write(data); err != nil {
 			return err
