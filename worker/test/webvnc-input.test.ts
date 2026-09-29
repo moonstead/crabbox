@@ -215,17 +215,29 @@ function harness(capabilities: string[]) {
       viewerSessionID: "webvnc_session_agent",
     },
   ];
+  // The stored sessions the viewers connected with; the person's browser is
+  // "browser_a", the agent's "browser_b".
+  const later = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const storedSessions = new Map<string, { leaseID: string; browser?: string; expiresAt: string }>([
+    ["webvnc_session_person", { leaseID, browser: "browser_a", expiresAt: later }],
+    ["webvnc_session_agent", { leaseID, browser: "browser_b", expiresAt: later }],
+  ]);
   const fleet = Object.create(FleetCoordinator.prototype) as {
     webVNCInput: WebVNCInputTracker;
     webVNCInputChange(
       request: Request,
       identifier: string,
-      session?: { session: string },
+      session?: { session: string; browser?: string },
     ): Promise<Response>;
     webVNCInputView(leaseID: string, agentID: string | undefined): unknown;
   };
   Object.assign(fleet, {
     env: {},
+    state: {
+      storage: {
+        get: async (key: string) => storedSessions.get(key.replace(/^webvnc-viewer-session:/, "")),
+      },
+    },
     webVNCInput: new WebVNCInputTracker(),
     webVNCViewers: new Map([[leaseID, new Map(viewers.map((viewer) => [viewer.id, viewer]))]]),
     webVNCAgents: new Map([
@@ -258,7 +270,7 @@ function harness(capabilities: string[]) {
   const change = (
     viewerID: string,
     action: string,
-    session: string,
+    session: string | { session: string; browser?: string },
     headers: Record<string, string> = {
       origin: "https://crabbox.test",
       "content-type": "application/json",
@@ -271,9 +283,9 @@ function harness(capabilities: string[]) {
         body: JSON.stringify({ viewerID, action }),
       }),
       leaseID,
-      { session },
+      typeof session === "string" ? { session } : session,
     );
-  return { fleet, sent, change };
+  return { fleet, sent, change, storedSessions };
 }
 
 describe("POST /portal/leases/{lease}/vnc/input", () => {
@@ -330,6 +342,70 @@ describe("POST /portal/leases/{lease}/vnc/input", () => {
     expect(response.status).toBe(409);
     await expect(response.json()).resolves.toMatchObject({ error: "viewer_not_connected" });
     expect(sent).toEqual([]);
+  });
+
+  it("lets a later session of the viewer's browser change its control", async () => {
+    // A second tab's bootstrap replaces the browser's session cookie, so the
+    // first tab's return arrives with the second tab's session.
+    const { fleet, sent, change } = harness(["input_gate"]);
+    const response = change("viewer_person", "return", {
+      session: "webvnc_session_person_tab2",
+      browser: "browser_a",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sent).toHaveLength(1);
+    const request = JSON.parse(sent[0]!) as { id: string; action: string };
+    expect(request.action).toBe("return");
+    fleet.webVNCInput.receive(
+      leaseID,
+      "agent_person",
+      JSON.stringify({
+        type: "input_result",
+        id: request.id,
+        ok: true,
+        owner: "agent",
+        holder: "none",
+      }),
+    );
+    const result = await response;
+    expect(result.status).toBe(200);
+    await expect(result.json()).resolves.toMatchObject({ ok: true, outcome: "confirmed" });
+  });
+
+  it("refuses a later session unless the viewer's live session has the same browser", async () => {
+    const refused = async (
+      session: { session: string; browser?: string },
+      // null: the viewer's session is no longer stored.
+      stored?: { leaseID: string; browser?: string; expiresAt: string } | null,
+    ) => {
+      const { sent, change, storedSessions } = harness(["input_gate"]);
+      if (stored === null) {
+        storedSessions.delete("webvnc_session_person");
+      } else if (stored) {
+        storedSessions.set("webvnc_session_person", stored);
+      }
+      const response = await change("viewer_person", "take", session);
+      expect(sent).toEqual([]);
+      return response.status;
+    };
+    const past = new Date(Date.now() - 1000).toISOString();
+    const later = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const statuses = [
+      // Another browser, and a session stored before browser IDs.
+      await refused({ session: "webvnc_session_other", browser: "browser_b" }),
+      await refused({ session: "webvnc_session_other" }),
+      // The viewer's session has ended, expired or belongs to another lease.
+      await refused({ session: "webvnc_session_other", browser: "browser_a" }, null),
+      await refused(
+        { session: "webvnc_session_other", browser: "browser_a" },
+        { leaseID, browser: "browser_a", expiresAt: past },
+      ),
+      await refused(
+        { session: "webvnc_session_other", browser: "browser_a" },
+        { leaseID: "cbx_000000000099", browser: "browser_a", expiresAt: later },
+      ),
+    ];
+    expect(statuses).toEqual([409, 409, 409, 409, 409]);
   });
 
   it("refuses when the desktop has no input gate", async () => {
