@@ -206,8 +206,12 @@ rather than to whoever is connected:
   `POST /portal/leases/{lease}/vnc/input` (`/vnc/embed/input` for the
   embedded viewer) and `{"viewerID": ..., "action": "take" | "return"}`. The
   route accepts only the coordinator's exact `Origin` and a JSON body, and
-  only for the requester's own viewer session. The coordinator carries it
-  down that viewer's own bridge connection as `input_request`.
+  only for a viewer connected with the requester's own viewer session, or
+  with another live session of the lease from the same browser. A later
+  bootstrap in a browser replaces the session cookie that its open tabs
+  send, so without this an older tab could not take or return control. The
+  coordinator carries the request down that viewer's own bridge connection
+  as `input_request`.
 - The gate decides and answers with `input_result`, and reports changes with
   `input_state`. `GET .../vnc/status` returns them as
   `input: {gate, owner, holder}`, where `owner` is `agent`, `human` or `none`

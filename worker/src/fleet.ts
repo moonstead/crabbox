@@ -11999,9 +11999,13 @@ export class FleetCoordinator {
         { status: 409 },
       );
     }
-    // Only the viewer's own session may change its control.
+    // Only the viewer's own session may change its control, or another session
+    // of the browser that holds it: the gate binds input per browser, and a
+    // later bootstrap in that browser replaces the session cookie of every
+    // viewer tab still open on the lease.
     const ownViewer = viewerSession
-      ? viewer.viewerSessionID === viewerSession.session
+      ? viewer.viewerSessionID === viewerSession.session ||
+        (await this.webVNCViewerInSameBrowser(lease.id, viewer, viewerSession))
       : viewer.viewerSessionID === undefined && viewer.owner === requestOwner(request);
     if (!ownViewer) {
       return json(
@@ -12042,6 +12046,25 @@ export class FleetCoordinator {
     // or may not have changed. The viewer reconnects and shows the gate's state.
     const status = { confirmed: 200, unknown: 202, refused: 409 }[result.outcome];
     return json({ leaseID: lease.id, viewerID, ...result }, { status });
+  }
+
+  private async webVNCViewerInSameBrowser(
+    leaseID: string,
+    viewer: WebVNCViewerSession,
+    viewerSession: WebVNCPortalViewerSessionRecord,
+  ): Promise<boolean> {
+    if (!viewerSession.browser || !viewer.viewerSessionID) {
+      return false;
+    }
+    const connected = await this.state.storage.get<WebVNCPortalViewerSessionRecord>(
+      webVNCPortalViewerSessionKey(viewer.viewerSessionID),
+    );
+    return (
+      connected !== undefined &&
+      connected.leaseID === leaseID &&
+      connected.browser === viewerSession.browser &&
+      Date.parse(connected.expiresAt) > Date.now()
+    );
   }
 
   private async webVNCTakeControl(request: Request, identifier: string): Promise<Response> {
