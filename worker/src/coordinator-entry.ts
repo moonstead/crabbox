@@ -309,11 +309,11 @@ function isWebVNCViewerSessionRequest(request: Request, url: URL): boolean {
   }
   const cookie = request.headers.get("cookie") ?? "";
   const embedRoute =
-    /^\/portal\/leases\/[^/]+\/vnc\/embed(?:\/(?:status|control|theme|handoff|viewer))?$/.test(
+    /^\/portal\/leases\/[^/]+\/vnc\/embed(?:\/(?:status|control|input|theme|handoff|viewer))?$/.test(
       url.pathname,
     );
   const portalRoute =
-    /^\/portal\/leases\/[^/]+\/vnc(?:\/(?:status|control|theme|handoff|viewer))?$/.test(
+    /^\/portal\/leases\/[^/]+\/vnc(?:\/(?:status|control|input|theme|handoff|viewer))?$/.test(
       url.pathname,
     );
   // Admission is not authentication: Fleet validates the embed session. A

@@ -381,6 +381,7 @@ describe("coordinator auth", () => {
           ["handoff", "POST"],
           ["viewer", "GET"],
           ["control", "POST"],
+          ["input", "POST"],
           ["theme", "POST"],
         ].map(async ([endpoint, method]) => {
           const prepared = await prepareCoordinatorRequest(
@@ -467,6 +468,21 @@ describe("coordinator auth", () => {
     );
     expect(sameOrigin).toMatchObject({ authenticated: false });
     expect("response" in sameOrigin).toBe(false);
+
+    // Taking and returning control posts to the input route; it must reach
+    // Fleet's viewer-session check, not the portal's 401.
+    const sameOriginInput = await prepareCoordinatorRequest(
+      new Request("https://broker.example.test/portal/leases/cbx_000000000001/vnc/input", {
+        method: "POST",
+        headers: {
+          cookie: sessionCookie,
+          origin: "https://broker.example.test",
+        },
+      }),
+      env,
+    );
+    expect(sameOriginInput).toMatchObject({ authenticated: false });
+    expect("response" in sameOriginInput).toBe(false);
 
     const outsideViewerScope = await prepareCoordinatorRequest(
       new Request("https://broker.example.test/portal/leases/cbx_000000000001/share", {
