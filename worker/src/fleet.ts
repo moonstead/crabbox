@@ -477,7 +477,9 @@ import {
   webVNCEmbedBootstrappedMarker,
   webVNCEmbedContract,
   webVNCEmbedOrigin,
+  webVNCEmbedBrowserCookieName,
   webVNCEmbedSessionCookieName,
+  webVNCPortalBrowserCookieName,
   webVNCPortalSessionCookieName,
   type WebVNCEmbedState,
 } from "./webvnc-embed";
@@ -485,6 +487,7 @@ import { WebVNCCredentialHandoffs, type WebVNCCredentialHandoffResult } from "./
 import {
   WebVNCInputTracker,
   webVNCInputBinding,
+  webVNCViewerInputKey,
   webVNCInputGateCapability,
   webVNCInputRequestRefusal,
   type WebVNCInputAction,
@@ -499,6 +502,7 @@ const maxRunTelemetrySamples = 60;
 const maxExternalRunnerSyncItems = 200;
 const webVNCPortalViewerTicketTTLSeconds = 120;
 const webVNCPortalViewerSessionTTLSeconds = 30 * 60;
+const webVNCViewerBrowserTTLSeconds = 12 * 60 * 60;
 const codeViewerTicketTTLSeconds = 120;
 const codeViewerSessionTTLSeconds = 8 * 60 * 60;
 export const replacedEgressSessionsPerLease = 256;
@@ -660,6 +664,8 @@ interface WebVNCPortalViewerSessionRecord extends PortalViewerSessionRecord {
   takeControl?: boolean;
   /** Opens only the unbranded embed viewer, never the portal viewer page. */
   embed?: true;
+  /** The browser's ID for this lease; the same across its sessions. */
+  browser?: string;
 }
 
 type WebVNCPortalViewerMode = "portal" | "embed";
@@ -11471,6 +11477,15 @@ export class FleetCoordinator {
     if (expiresAt <= now.getTime()) {
       return ticketRequired();
     }
+    // Only this mode's cookie on this lease's path is read, and any value
+    // that is not one of ours gets a new ID.
+    const knownBrowser = cookieValue(
+      request.headers.get("cookie") ?? "",
+      webVNCViewerBrowserCookieName(mode),
+    );
+    const browser = validWebVNCViewerBrowser(knownBrowser)
+      ? knownBrowser
+      : newWebVNCViewerBrowser();
     const session: WebVNCPortalViewerSessionRecord = {
       session: newWebVNCPortalViewerSession(),
       leaseID: ticket.leaseID,
@@ -11487,6 +11502,7 @@ export class FleetCoordinator {
         : {}),
       ...(ticket.takeControl ? { takeControl: true } : {}),
       ...(ticket.embed ? { embed: true as const } : {}),
+      browser,
       createdAt: now.toISOString(),
       expiresAt: new Date(expiresAt).toISOString(),
     };
@@ -11498,20 +11514,19 @@ export class FleetCoordinator {
     const frameAncestors = ticket.embed && embedOrigin ? embedOrigin : "'none'";
     const opening = ticket.embed ? "Opening desktop" : "Opening WebVNC";
     const nonce = randomHexToken("");
+    const headers = new Headers({
+      "cache-control": "no-store",
+      "content-security-policy": `default-src 'none'; base-uri 'none'; frame-ancestors ${frameAncestors}; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
+      "content-type": "text/html; charset=utf-8",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    });
+    headers.append("set-cookie", webVNCPortalViewerSessionCookie(session));
+    headers.append("set-cookie", webVNCViewerBrowserCookie(session.leaseID, browser, mode));
     return new Response(
       // Palette: vendored carapace v0.6.1 neutral product tokens; self-contained flash page.
       `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${opening}</title><style nonce="${nonce}">:root{color-scheme:dark light;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{min-height:100vh;margin:0;display:grid;place-items:center;background:#0d0b0b;color:#f4f1ef}@media (prefers-color-scheme:light){body{background:#fbfaf7;color:#171514}}</style></head><body><p>${opening}...</p><script nonce="${nonce}">location.replace(${JSON.stringify(location)})</script></body></html>`,
-      {
-        status: 200,
-        headers: {
-          "cache-control": "no-store",
-          "content-security-policy": `default-src 'none'; base-uri 'none'; frame-ancestors ${frameAncestors}; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
-          "content-type": "text/html; charset=utf-8",
-          "referrer-policy": "no-referrer",
-          "set-cookie": webVNCPortalViewerSessionCookie(session),
-          "x-content-type-options": "nosniff",
-        },
-      },
+      { status: 200, headers },
     );
   }
 
@@ -13116,13 +13131,10 @@ export class FleetCoordinator {
       const viewerID = validWebVNCSessionID(requestedViewerID)
         ? requestedViewerID
         : newWebVNCSessionID("viewer");
-      // A gate grants input per viewer session; a viewer without a portal
-      // session is its own session for this connection only.
+      // A gate grants input per browser that bootstrapped the viewer
+      // session; see webVNCViewerInputKey.
       const inputBinding = this.webVNCAgentHasInputGate(lease.id, agent.id)
-        ? await webVNCInputBinding(
-            lease.id,
-            viewerSession ? `session:${viewerSession.session}` : `viewer:${owner}:${viewerID}`,
-          )
+        ? await webVNCInputBinding(lease.id, webVNCViewerInputKey(viewerSession, owner, viewerID))
         : undefined;
 
       const upgrade = this.state.createWebSocketUpgrade();
@@ -23816,6 +23828,10 @@ function newWebVNCPortalViewerSession(): string {
   return randomHexToken("webvnc_session_");
 }
 
+function newWebVNCViewerBrowser(): string {
+  return randomHexToken("webvnc_browser_");
+}
+
 function newRuntimeAdapterTicket(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
@@ -23943,6 +23959,10 @@ function validWebVNCPortalViewerTicket(value: string | undefined): value is stri
 
 function validWebVNCPortalViewerSession(value: string | undefined): value is string {
   return typeof value === "string" && /^webvnc_session_[a-f0-9]{32}$/.test(value);
+}
+
+function validWebVNCViewerBrowser(value: string | undefined): value is string {
+  return typeof value === "string" && /^webvnc_browser_[a-f0-9]{32}$/.test(value);
 }
 
 function validWebVNCCredentialHandoffTicket(value: string | undefined): value is string {
@@ -24391,6 +24411,26 @@ function webVNCPortalViewerSessionCookie(session: WebVNCPortalViewerSessionRecor
     `Path=${webVNCPortalViewerSessionCookiePath(session.leaseID, mode)}`,
     ...webVNCPortalViewerSessionCookieAttributes(mode),
     ...(mode === "embed" ? [`Max-Age=${Math.max(1, remainingSeconds)}`] : []),
+  ].join("; ");
+}
+
+function webVNCViewerBrowserCookieName(mode: WebVNCPortalViewerMode): string {
+  return mode === "embed" ? webVNCEmbedBrowserCookieName : webVNCPortalBrowserCookieName;
+}
+
+// Same path and attributes as the mode's session cookie. The embed one lasts
+// twelve hours from the last bootstrap; the portal one, like its session
+// cookie, until the browser closes.
+function webVNCViewerBrowserCookie(
+  leaseID: string,
+  browser: string,
+  mode: WebVNCPortalViewerMode,
+): string {
+  return [
+    `${webVNCViewerBrowserCookieName(mode)}=${encodeURIComponent(browser)}`,
+    `Path=${webVNCPortalViewerSessionCookiePath(leaseID, mode)}`,
+    ...webVNCPortalViewerSessionCookieAttributes(mode),
+    ...(mode === "embed" ? [`Max-Age=${webVNCViewerBrowserTTLSeconds}`] : []),
   ].join("; ");
 }
 

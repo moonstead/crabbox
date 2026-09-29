@@ -97,9 +97,9 @@ interface Pending {
 }
 
 /**
- * The opaque value the gate uses to tell viewer sessions apart. It is stable
- * for one viewer session on one lease, so a reconnect resumes control, and
- * reveals nothing about the session's cookie.
+ * The opaque value the gate uses to tell viewers apart. It is stable for one
+ * key on one lease, so a reconnect resumes control, and reveals nothing about
+ * the key or any cookie.
  */
 export async function webVNCInputBinding(leaseID: string, sessionKey: string): Promise<string> {
   const digest = await crypto.subtle.digest(
@@ -107,6 +107,26 @@ export async function webVNCInputBinding(leaseID: string, sessionKey: string): P
     new TextEncoder().encode(`${bindingDomain}\n${leaseID}\n${sessionKey}`),
   );
   return base64URL(new Uint8Array(digest));
+}
+
+/**
+ * The key a viewer's binding comes from. A bootstrapped viewer session
+ * carries its browser's ID, which outlives the session, so a reload or a new
+ * session in the same browser keeps control. A session stored before
+ * browser IDs keys on itself, and a viewer without a session is its own key
+ * for this connection only.
+ */
+export function webVNCViewerInputKey(
+  viewerSession: { session: string; browser?: string } | undefined,
+  owner: string,
+  viewerID: string,
+): string {
+  if (!viewerSession) {
+    return `viewer:${owner}:${viewerID}`;
+  }
+  return viewerSession.browser
+    ? `browser:${viewerSession.browser}`
+    : `session:${viewerSession.session}`;
 }
 
 function parseGateMessage(message: unknown): Record<string, unknown> | undefined {
