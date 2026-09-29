@@ -39,6 +39,22 @@ export function nodeRequestAbortSignal(
   };
 }
 
+/**
+ * How to finish a request whose handling failed. A client that closed its
+ * request or response is not a coordinator failure, and a response that has
+ * started cannot become an error response. The request's abort signal is
+ * already aborted when a close fails the response write, because it listens
+ * for the close first.
+ */
+export function failedRequestOutcome(
+  signal: AbortSignal,
+  response: Pick<ServerResponse, "headersSent" | "destroyed">,
+): "client_closed" | "response_started" | "error_response" {
+  if (signal.aborted) return "client_closed";
+  if (response.headersSent || response.destroyed) return "response_started";
+  return "error_response";
+}
+
 export type FleetRequestQueue = CoordinatorRequestQueue;
 
 export function requestBodyLimit(request: Request, authenticated: boolean): number {

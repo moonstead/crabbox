@@ -11,6 +11,7 @@ import {
   createUntrustedForwardingDiagnostic,
   drainAndStop,
   authenticatedRequestBodyBytes,
+  failedRequestOutcome,
   fleetRequestQueue,
   forwardedRequestProtocol,
   isReadinessRequestMethod,
@@ -350,6 +351,46 @@ describe("Node server support", () => {
     await expect(writeNodeResponseBody(response, Buffer.from("payload"))).rejects.toThrow(
       "Premature close",
     );
+  });
+
+  it("treats a response write the client closes as closed by the client", async () => {
+    const request = Object.assign(new EventEmitter(), { aborted: false });
+    const response = new Writable({
+      write() {
+        this.destroy();
+      },
+    });
+    const cancellation = nodeRequestAbortSignal(
+      request as unknown as IncomingMessage,
+      response as unknown as ServerResponse,
+    );
+
+    await expect(writeNodeResponseBody(response, Buffer.from("payload"))).rejects.toThrow(
+      "Premature close",
+    );
+    expect(
+      failedRequestOutcome(cancellation.signal, {
+        headersSent: true,
+        destroyed: response.destroyed,
+      }),
+    ).toBe("client_closed");
+    cancellation.dispose();
+  });
+
+  it("answers a failed request with an error only before its response starts", () => {
+    const live = new AbortController().signal;
+    expect(failedRequestOutcome(live, { headersSent: false, destroyed: false })).toBe(
+      "error_response",
+    );
+    expect(failedRequestOutcome(live, { headersSent: true, destroyed: false })).toBe(
+      "response_started",
+    );
+    expect(failedRequestOutcome(live, { headersSent: false, destroyed: true })).toBe(
+      "response_started",
+    );
+    expect(
+      failedRequestOutcome(AbortSignal.abort(), { headersSent: false, destroyed: false }),
+    ).toBe("client_closed");
   });
 
   it("emits separate Set-Cookie fields through Node HTTP", async () => {

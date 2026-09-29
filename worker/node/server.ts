@@ -19,6 +19,7 @@ import {
   closeServer,
   createUntrustedForwardingDiagnostic,
   drainAndStop,
+  failedRequestOutcome,
   fleetRequestQueue,
   forwardedRequestProtocol,
   isReadinessRequestMethod,
@@ -137,8 +138,15 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
       request.destroy();
       return;
     }
-    // Provider failures can contain environment-backed credentials; keep only safe context here.
-    console.error("coordinator request failed");
+    const outcome = failedRequestOutcome(cancellation.signal, response);
+    if (outcome !== "client_closed") {
+      // Provider failures can contain environment-backed credentials; keep only safe context here.
+      console.error("coordinator request failed");
+    }
+    if (outcome !== "error_response") {
+      response.destroy();
+      return;
+    }
     await writeResponse(response, Response.json({ error: "internal_error" }, { status: 500 }));
   } finally {
     cancellation.dispose();
