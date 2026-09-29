@@ -110,7 +110,8 @@ for one visible desktop lease. The CLI writes a private temporary HTML file and
 opens its random `file:` URL; that file-origin page submits the ticket to
 `/vnc/bootstrap` in a POST body. Consumption binds a non-persistent
 `crabbox_webvnc_session` cookie to that lease's `/vnc` path and a server-side
-lifetime of at most 30 minutes. The stored principal uses the same owner/org,
+lifetime of at most 30 minutes, and sets or keeps the browser's ID in a
+non-persistent `crabbox_webvnc_browser` cookie on the same path. The stored principal uses the same owner/org,
 shared-token or admin-grant version, grant revocation, and lease ACL checks as
 existing Portal and bridge sessions.
 
@@ -153,7 +154,12 @@ The contract is the ticket flow above with `embed: true`:
    distinct from the portal viewer's `crabbox_webvnc_session` on `/vnc`, so an
    inline frame and a portal tab for the same lease can coexist in one
    browser, including when the embedding site and the coordinator are
-   same-site and both cookies travel together.
+   same-site and both cookies travel together. The response also sets
+   `crabbox_webvnc_embed_browser`, the browser's ID for the lease, with the
+   same path and attributes and `Max-Age=43200`, keeping the ID the browser
+   already sends. Exclusive input is bound to that ID, so a new ticket in the
+   same browser keeps control (see
+   [webvnc](../commands/webvnc.md#exclusive-input-with-a-guest-input-gate)).
 3. The embed page renders only the noVNC display and its own controls: status,
    sizing, take control, clipboard, reconnect and fullscreen. It has no brand,
    navigation, log out, share or bridge command, never names the lease, and

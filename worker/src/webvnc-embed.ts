@@ -51,6 +51,14 @@ export const webVNCEmbedSessionCookieName = "crabbox_webvnc_embed_session";
 export const webVNCPortalSessionCookieName = "crabbox_webvnc_session";
 
 /**
+ * Cookie names of the random ID a bootstrap gives the browser. It outlives
+ * each viewer session, so input control, which is bound to it, survives a
+ * reload or a new session in the same browser. Alone it grants nothing.
+ */
+export const webVNCEmbedBrowserCookieName = "crabbox_webvnc_embed_browser";
+export const webVNCPortalBrowserCookieName = "crabbox_webvnc_browser";
+
+/**
  * Query marker the embed bootstrap adds to the viewer URL it navigates to.
  * When the viewer page then arrives without any embed cookie, the browser
  * refused to store a partitioned cross-site cookie, and the frame reports

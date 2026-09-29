@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { FleetCoordinator, isReservedWebVNCControlFrame } from "../src/fleet";
 import { portalVNC } from "../src/portal";
-import { WebVNCInputTracker, webVNCInputBinding } from "../src/webvnc-input";
+import { WebVNCInputTracker, webVNCInputBinding, webVNCViewerInputKey } from "../src/webvnc-input";
 
 const leaseID = "cbx_000000000043";
 
@@ -16,6 +16,39 @@ describe("WebVNC input gate binding", () => {
       binding,
     );
     expect(binding).not.toContain("webvnc_session");
+  });
+
+  it("keys a viewer session on its browser, so a reload keeps control", () => {
+    const browser = "webvnc_browser_0123456789abcdef0123456789abcdef";
+    const first = webVNCViewerInputKey(
+      { session: "webvnc_session_aaa", browser },
+      "owner@example.com",
+      "viewer_1",
+    );
+    const reloaded = webVNCViewerInputKey(
+      { session: "webvnc_session_bbb", browser },
+      "owner@example.com",
+      "viewer_2",
+    );
+    expect(reloaded).toBe(first);
+    expect(
+      webVNCViewerInputKey(
+        { session: "webvnc_session_ccc", browser: "webvnc_browser_other" },
+        "owner@example.com",
+        "viewer_1",
+      ),
+    ).not.toBe(first);
+    // A session stored before browser IDs keys on itself; a viewer without
+    // a session only on its connection.
+    expect(
+      webVNCViewerInputKey({ session: "webvnc_session_aaa" }, "owner@example.com", "viewer_1"),
+    ).toBe("session:webvnc_session_aaa");
+    expect(webVNCViewerInputKey(undefined, "owner@example.com", "viewer_1")).toBe(
+      "viewer:owner@example.com:viewer_1",
+    );
+    expect(webVNCViewerInputKey(undefined, "owner@example.com", "viewer_2")).not.toBe(
+      webVNCViewerInputKey(undefined, "owner@example.com", "viewer_1"),
+    );
   });
 
   it("reserves input frames so a viewer cannot forge a binding or request", () => {

@@ -186,13 +186,22 @@ recognises that greeting, advertises the `input_gate` capability, and then
 frames all traffic: RFB bytes as data frames, and a small set of JSON messages
 as control frames. A guest without a gate is unaffected.
 
-With a gate, input is bound to a viewer session rather than to whoever is
-connected:
+With a gate, input is bound to the browser that opened a viewer session
+rather than to whoever is connected:
 
+- A viewer bootstrap gives the browser a random ID for the lease, in a cookie
+  with the same path and attributes as the session cookie
+  (`crabbox_webvnc_browser`, or `crabbox_webvnc_embed_browser` for 12 hours
+  from the last embed bootstrap), and keeps a valid ID the browser already
+  sends. Each session records its browser's ID. The ID alone grants nothing:
+  every route still needs a valid session, and every session a valid ticket.
 - When the coordinator pairs a viewer with a bridge connection, it sends that
   connection one `input_binding`: the lease ID and a SHA-256 value derived
-  from the lease and the viewer's portal session, never the session cookie.
-  A reconnect of the same viewer session gets the same binding.
+  from the lease and the session's browser ID, never a cookie. A reconnect,
+  a reload or a new session in the same browser gets the same binding, and
+  so do other tabs of that browser; another browser gets a different one. A
+  session stored before browser IDs is bound to itself, and a viewer without
+  a viewer session to its connection.
 - The viewer page asks for control with
   `POST /portal/leases/{lease}/vnc/input` (`/vnc/embed/input` for the
   embedded viewer) and `{"viewerID": ..., "action": "take" | "return"}`. The
