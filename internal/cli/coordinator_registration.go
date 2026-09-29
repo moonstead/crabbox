@@ -174,15 +174,18 @@ func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config,
 	target := lease.SSH
 	provider := firstNonBlank(server.Provider, cfg.Provider)
 	targetOS := firstNonBlank(target.TargetOS, cfg.TargetOS)
+	// A registration replaces the coordinator's record, so it keeps the
+	// capabilities the lease was created with: ssh, cp and other commands run
+	// without --desktop or --browser and must not register them as false.
 	registration := CoordinatorLeaseRegistration{
 		Slug:               firstNonBlank(ServerSlug(server), lease.LeaseID),
 		Provider:           provider,
 		TargetOS:           targetOS,
 		WindowsMode:        firstNonBlank(target.WindowsMode, cfg.WindowsMode),
-		Desktop:            cfg.Desktop,
-		DesktopEnv:         normalizedDesktopEnv(cfg.DesktopEnv),
-		Browser:            cfg.Browser,
-		Code:               cfg.Code,
+		Desktop:            cfg.Desktop || labelBool(server.Labels["desktop"]),
+		DesktopEnv:         coordinatorRegistrationDesktopEnv(cfg, server),
+		Browser:            cfg.Browser || labelBool(server.Labels["browser"]),
+		Code:               cfg.Code || labelBool(server.Labels["code"]),
 		CloudID:            server.CloudID,
 		ServerID:           server.ID,
 		ServerName:         server.Name,
@@ -287,6 +290,13 @@ func persistAutomaticCoordinatorRegistrationBinding(leaseID string, server *Serv
 		claim.CoordinatorRegistrationURL = expectedURL
 		return nil
 	})
+}
+
+func coordinatorRegistrationDesktopEnv(cfg Config, server Server) string {
+	if labelBool(server.Labels["desktop"]) {
+		return normalizedDesktopEnv(firstNonBlank(server.Labels["desktop_env"], cfg.DesktopEnv))
+	}
+	return normalizedDesktopEnv(cfg.DesktopEnv)
 }
 
 func coordinatorRegistrationSSHUser(target SSHTarget) string {

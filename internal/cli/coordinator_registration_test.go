@@ -1356,6 +1356,60 @@ func TestRegisterCoordinatorLeaseBestEffortMapsDirectLease(t *testing.T) {
 	}
 }
 
+func TestRegisterCoordinatorLeaseKeepsLeaseCapabilities(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	var got CoordinatorLeaseRegistration
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"lease": map[string]any{
+			"id": "cbx_123", "provider": "proxmox", "lifecycle": "registered", "state": "active",
+		}})
+	}))
+	defer server.Close()
+
+	var stderr bytes.Buffer
+	cfg := baseConfig()
+	cfg.Provider = "proxmox"
+	cfg.Coordinator = server.URL
+	cfg.CoordToken = "token"
+	cfg.BrokerMode = BrokerModeRegistered
+	app := App{Stderr: &stderr}
+	lease := LeaseTarget{
+		LeaseID: "cbx_123",
+		Server: Server{
+			Provider: "proxmox",
+			CloudID:  "1000",
+			Labels: map[string]string{
+				"lease": "cbx_123", "desktop": "true", "desktop_env": "wayland",
+				"browser": "true", "code": "true",
+			},
+		},
+		SSH: SSHTarget{Host: "192.0.2.10", User: "crabbox", Port: "22", TargetOS: targetLinux},
+	}
+	// ssh and similar commands register with a config that asks for no capabilities.
+	if err := app.registerCoordinatorLeaseBestEffort(context.Background(), cfg, &lease); err != nil {
+		t.Fatal(err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	if !got.Desktop || got.DesktopEnv != "wayland" || !got.Browser || !got.Code {
+		t.Fatalf("registration=%#v", got)
+	}
+
+	got = CoordinatorLeaseRegistration{}
+	lease.Server.Labels = map[string]string{"lease": "cbx_123"}
+	if err := app.registerCoordinatorLeaseBestEffort(context.Background(), cfg, &lease); err != nil {
+		t.Fatal(err)
+	}
+	if got.Desktop || got.DesktopEnv != desktopEnvXFCE || got.Browser || got.Code {
+		t.Fatalf("registration without capabilities=%#v", got)
+	}
+}
+
 func TestAdapterRegistrationRotatesRejectedTerminalGeneration(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("CRABBOX_ADAPTER_ID", "mac-lab")
