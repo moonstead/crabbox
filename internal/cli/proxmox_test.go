@@ -896,6 +896,21 @@ func TestProxmoxWaitTaskRequiresOKExitStatus(t *testing.T) {
 			statusData: map[string]any{"status": "stopped", "exitstatus": "ERROR"},
 			want:       "UPID:pve1:test failed: ERROR",
 		},
+		{
+			name:       "warnings without a count",
+			statusData: map[string]any{"status": "stopped", "exitstatus": "WARNINGS: "},
+			want:       "UPID:pve1:test failed: WARNINGS: ",
+		},
+		{
+			name:       "zero warnings",
+			statusData: map[string]any{"status": "stopped", "exitstatus": "WARNINGS: 0"},
+			want:       "UPID:pve1:test failed: WARNINGS: 0",
+		},
+		{
+			name:       "warnings with trailing text",
+			statusData: map[string]any{"status": "stopped", "exitstatus": "WARNINGS: 1 command failed"},
+			want:       "UPID:pve1:test failed: WARNINGS: 1 command failed",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -914,6 +929,25 @@ func TestProxmoxWaitTaskRequiresOKExitStatus(t *testing.T) {
 			var waitErr *proxmoxTaskWaitError
 			if errors.As(err, &waitErr) {
 				t.Fatalf("terminal task failure classified as ambiguous: %v", err)
+			}
+		})
+	}
+}
+
+func TestProxmoxWaitTaskAcceptsWarnings(t *testing.T) {
+	// Proxmox ends a task that completed with warnings, such as creating an
+	// unprivileged container from a systemd 255 archive without nesting, with
+	// "WARNINGS: <n>".
+	for _, exitStatus := range []string{"WARNINGS: 1", "WARNINGS: 12"} {
+		t.Run(exitStatus, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"status": "stopped", "exitstatus": exitStatus}})
+			}))
+			defer server.Close()
+
+			client := testProxmoxClient(t, server.URL)
+			if err := client.waitTask(context.Background(), "UPID:pve1:test"); err != nil {
+				t.Fatalf("err=%v, want the completed task accepted", err)
 			}
 		})
 	}

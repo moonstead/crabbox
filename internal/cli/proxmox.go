@@ -1492,6 +1492,23 @@ func (c *ProxmoxClient) configureVM(ctx context.Context, vmid int, form url.Valu
 	return c.waitTask(ctx, upid)
 }
 
+// proxmoxTaskWarnings reports whether a stopped task's exit status is
+// Proxmox's "WARNINGS: <n>": the task completed and logged n warnings. Proxmox
+// creates an unprivileged container from a systemd 255 archive this way when
+// nesting is off, which Crabbox never asks for.
+func proxmoxTaskWarnings(exitStatus string) bool {
+	count, ok := strings.CutPrefix(exitStatus, "WARNINGS: ")
+	if !ok || count == "" || count[0] == '0' {
+		return false
+	}
+	for _, r := range count {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 type proxmoxTaskStatus struct {
 	Status     string `json:"status"`
 	ExitStatus string `json:"exitstatus"`
@@ -1509,7 +1526,7 @@ func (c *ProxmoxClient) waitTask(ctx context.Context, upid string) error {
 			return &proxmoxTaskWaitError{err: err}
 		}
 		if status.Status == "stopped" {
-			if status.ExitStatus == "OK" {
+			if status.ExitStatus == "OK" || proxmoxTaskWarnings(status.ExitStatus) {
 				return nil
 			}
 			if status.ExitStatus == "" {
