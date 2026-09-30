@@ -1421,15 +1421,39 @@ func TestProxmoxBootstrapProbeFailureDoesNotRunInput(t *testing.T) {
 	}
 }
 
-func TestProxmoxCreateServerFlow(t *testing.T) {
-	for _, failBootstrap := range []bool{false, true} {
-		t.Run(fmt.Sprintf("bootstrap_failure=%t", failBootstrap), func(t *testing.T) {
-			testProxmoxCreateServerFlow(t, failBootstrap)
-		})
+func TestProxmoxSSHUsesPort22Only(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "proxmox"
+	if err := applyProviderConfigDefaults(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts); strings.Join(got, ",") != "22" {
+		t.Fatalf("proxmox ssh ports=%v, want 22 alone", got)
+	}
+	cfg = baseConfig()
+	cfg.Provider = "proxmox"
+	cfg.SSHPort = "2200"
+	MarkSSHPortExplicit(&cfg)
+	if err := applyProviderConfigDefaults(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SSHPort != "2200" {
+		t.Fatalf("explicit ssh port=%q, want 2200", cfg.SSHPort)
 	}
 }
 
-func testProxmoxCreateServerFlow(t *testing.T, failBootstrap bool) {
+func TestProxmoxCreateServerFlow(t *testing.T) {
+	for _, failBootstrap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bootstrap_failure=%t", failBootstrap), func(t *testing.T) {
+			testProxmoxCreateServerFlow(t, failBootstrap, true)
+		})
+	}
+	t.Run("linked_clone", func(t *testing.T) {
+		testProxmoxCreateServerFlow(t, false, false)
+	})
+}
+
+func testProxmoxCreateServerFlow(t *testing.T, failBootstrap, fullClone bool) {
 	var nativeCfg Config
 	if failBootstrap {
 		nativeCfg, _ = installProxmoxBootstrapChild(t, "printf 'fixture-bootstrap-cleanup-diagnostic\\n' >&2", 7)
@@ -1539,6 +1563,7 @@ func testProxmoxCreateServerFlow(t *testing.T, failBootstrap bool) {
 	cfg.Proxmox.Storage = "local-lvm"
 	cfg.Proxmox.Pool = "ci"
 	cfg.Proxmox.Bridge = "vmbr1"
+	cfg.Proxmox.FullClone = fullClone
 	cfg.ServerType = "template-9000"
 	client, err := NewProxmoxClient(cfg)
 	if err != nil {
@@ -1564,11 +1589,22 @@ func testProxmoxCreateServerFlow(t *testing.T, failBootstrap bool) {
 	if got.CloudID != "101" || got.PublicNet.IPv4.IP != "192.0.2.44" || got.Labels["lease"] != "cbx_123456abcdef" {
 		t.Fatalf("server=%#v", got)
 	}
-	if forms[0].Get("newid") != "101" || forms[0].Get("storage") != "local-lvm" || forms[0].Get("pool") != "ci" {
+	if forms[0].Get("newid") != "101" || forms[0].Get("pool") != "ci" {
 		t.Fatalf("clone form=%v", forms[0])
+	}
+	// Proxmox refuses a target storage for a linked clone.
+	if fullClone && (forms[0].Get("full") != "1" || forms[0].Get("storage") != "local-lvm") {
+		t.Fatalf("full clone form=%v", forms[0])
+	}
+	if !fullClone && (forms[0].Get("full") != "0" || forms[0].Has("storage")) {
+		t.Fatalf("linked clone form=%v", forms[0])
 	}
 	if forms[1].Get("ciuser") != "crabbox" || !strings.Contains(forms[1].Get("sshkeys"), "ssh-ed25519") || forms[1].Get("net0") != "virtio,bridge=vmbr1" {
 		t.Fatalf("config form=%v", forms[1])
+	}
+	// The template owns its packages: no first-boot upgrade holds apt's lock.
+	if forms[1].Get("ciupgrade") != "0" {
+		t.Fatalf("config form ciupgrade=%q", forms[1].Get("ciupgrade"))
 	}
 	if !strings.Contains(bootstrapInput, "crabbox-ready") {
 		t.Fatalf("bootstrap input=%q", bootstrapInput)

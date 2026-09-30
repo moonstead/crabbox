@@ -56,7 +56,7 @@ func (c *ProxmoxClient) waitGuestSSHHostKey(ctx context.Context, vmid int) (stri
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-time.After(proxmoxGuestPollInterval):
 		}
 	}
 }

@@ -766,7 +766,7 @@ var newClient = func(cfg core.Config) (proxmoxClient, error) { return core.NewPr
 
 var waitForSSHReadyFunc = core.WaitForSSHReady
 
-var proxmoxIPPollInterval = 2 * time.Second
+var proxmoxIPPollInterval = time.Second
 var proxmoxDeleteVerifyPollInterval = time.Second
 var proxmoxDeleteVerifyTimeout = 30 * time.Second
 

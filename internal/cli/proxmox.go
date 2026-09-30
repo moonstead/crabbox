@@ -42,6 +42,11 @@ var (
 	proxmoxRunSSHQuietWithOptions = runSSHQuietWithOptions
 	proxmoxRunSSHInput            = runSSHInput
 	proxmoxAPITokenPattern        = regexp.MustCompile(`PVEAPIToken=[A-Za-z0-9@._!%+=:/~-]+`)
+	// Proxmox tasks and a starting guest settle in seconds, and each check is
+	// one cheap API call or SSH probe, so a lease waits at most this long
+	// after the step it waits for is done.
+	proxmoxTaskPollInterval  = 500 * time.Millisecond
+	proxmoxGuestPollInterval = time.Second
 )
 
 type ProxmoxError struct {
@@ -1094,7 +1099,9 @@ func (c *ProxmoxClient) CreateServerWithVMID(ctx context.Context, cfg Config, pu
 		"name":  {name},
 		"full":  {full},
 	}
-	if cfg.Proxmox.Storage != "" {
+	// A linked clone shares the template's storage, and Proxmox refuses a
+	// target storage for one.
+	if cfg.Proxmox.Storage != "" && cfg.Proxmox.FullClone {
 		clone.Set("storage", cfg.Proxmox.Storage)
 	}
 	if cfg.Proxmox.Pool != "" {
@@ -1148,6 +1155,10 @@ func (c *ProxmoxClient) CreateServerWithVMID(ctx context.Context, cfg Config, pu
 		"agent":       {"enabled=1"},
 		"description": {description},
 		"tags":        {"crabbox"},
+		// Proxmox otherwise has cloud-init upgrade every package at first
+		// boot, which holds apt's lock while the bootstrap runs. The template
+		// owns its packages, as on every other provider.
+		"ciupgrade": {"0"},
 	}
 	if cfg.Proxmox.Bridge != "" {
 		config.Set("net0", "virtio,bridge="+cfg.Proxmox.Bridge)
@@ -1206,7 +1217,7 @@ func (c *ProxmoxClient) waitServerIP(ctx context.Context, vmid int) (Server, err
 		select {
 		case <-ctx.Done():
 			return Server{}, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(proxmoxGuestPollInterval):
 		}
 	}
 }
@@ -1247,7 +1258,7 @@ func (c *ProxmoxClient) bootstrapSSH(ctx context.Context, host string, cfg Confi
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(proxmoxGuestPollInterval):
 		}
 	}
 }
@@ -1540,7 +1551,7 @@ func (c *ProxmoxClient) waitTask(ctx context.Context, upid string) error {
 		select {
 		case <-ctx.Done():
 			return &proxmoxTaskWaitError{err: ctx.Err()}
-		case <-time.After(2 * time.Second):
+		case <-time.After(proxmoxTaskPollInterval):
 		}
 	}
 }
@@ -1674,9 +1685,9 @@ func proxmoxBootstrapScript(cfg Config) string {
 	ready := "/usr/local/bin/crabbox-ready"
 	if capabilities != "" {
 		// Template desktop services may need a moment after their restart.
-		ready = `for _ in $(seq 1 30); do
+		ready = `for _ in $(seq 1 120); do
   /usr/local/bin/crabbox-ready >/dev/null 2>&1 && break
-  sleep 2
+  sleep 0.5
 done
 /usr/local/bin/crabbox-ready`
 	}
@@ -1698,8 +1709,16 @@ retry() {
     n=$((n + 1))
   done
 }
-retry apt-get update
-retry apt-get install -y --no-install-recommends openssh-server ca-certificates curl git rsync jq
+# A prepared template already has these, so apt runs only for one that lacks
+# any: refreshing package lists from empty takes most of a fresh clone's start.
+missing=0
+for package in openssh-server ca-certificates curl git rsync jq; do
+  [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null)" = "install ok installed" ] || missing=1
+done
+if [ "$missing" = 1 ]; then
+  retry apt-get update
+  retry apt-get install -y --no-install-recommends openssh-server ca-certificates curl git rsync jq
+fi
 chown -R %[2]s:%[2]s %[1]s /var/cache/crabbox || true
 cat >/usr/local/bin/crabbox-ready <<'READY'
 #!/usr/bin/env bash

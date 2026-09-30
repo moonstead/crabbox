@@ -1034,6 +1034,12 @@ func applyProviderConfigDefaults(cfg *Config) error {
 	if cfg.Proxmox.WorkRoot != "" {
 		cfg.WorkRoot = cfg.Proxmox.WorkRoot
 	}
+	// Proxmox guests run sshd on 22 alone, so the generic first try on 2222
+	// never answers. On a guest network that drops other ports, every SSH
+	// step waited out that try's whole connect timeout before falling back.
+	if cfg.SSHPort == "" || cfg.SSHPort == baseConfig().SSHPort {
+		cfg.SSHPort = "22"
+	}
 	return nil
 }
 

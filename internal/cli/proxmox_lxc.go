@@ -495,7 +495,7 @@ func (c *ProxmoxClient) bootstrapLXCSSH(ctx context.Context, host string, cfg Co
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(proxmoxGuestPollInterval):
 		}
 	}
 }

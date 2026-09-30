@@ -6,7 +6,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +41,43 @@ func TestProxmoxHeadlessBootstrapHasNoTemplateCapabilities(t *testing.T) {
 		t.Fatal("headless readiness no longer runs once after bootstrap")
 	}
 	requireBashSyntax(t, script)
+}
+
+func TestProxmoxBootstrapRunsAptOnlyForMissingPackages(t *testing.T) {
+	for _, cfg := range []Config{proxmoxTemplateTestConfig(false, false), proxmoxTemplateTestConfig(true, true)} {
+		script := proxmoxBootstrapScript(cfg)
+		check := strings.Index(script, "for package in openssh-server ca-certificates curl git rsync jq; do")
+		guard := strings.Index(script, "if [ \"$missing\" = 1 ]; then\n  retry apt-get update\n  retry apt-get install -y --no-install-recommends openssh-server ca-certificates curl git rsync jq\nfi\n")
+		if check < 0 || guard < check {
+			t.Fatalf("bootstrap does not guard apt behind the package check:\n%s", script)
+		}
+		if strings.Count(script, "apt-get update") != 1 {
+			t.Fatal("bootstrap refreshes package lists outside the guard")
+		}
+	}
+	// Run the check itself against a stub dpkg-query: apt runs only when a
+	// package is missing.
+	script := proxmoxBootstrapScript(proxmoxTemplateTestConfig(false, false))
+	check := script[strings.Index(script, "missing=0\n"):strings.Index(script, "chown -R ")]
+	for _, tc := range []struct {
+		status string
+		want   string
+	}{{"install ok installed", ""}, {"deinstall ok config-files", "apt-get update\napt-get install\n"}} {
+		dir := t.TempDir()
+		stub := "#!/bin/sh\nprintf '%s' " + shellQuote(tc.status) + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "dpkg-query"), []byte(stub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("bash", "-c", "set -euo pipefail\nretry() { echo \"$1 $2\"; }\n"+check)
+		cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin"}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("status %q: %v: %s", tc.status, err, out)
+		}
+		if string(out) != tc.want {
+			t.Fatalf("status %q ran %q, want %q", tc.status, out, tc.want)
+		}
+	}
 }
 
 func TestProxmoxTemplateBootstrapConfiguresWithoutInstallingPackages(t *testing.T) {

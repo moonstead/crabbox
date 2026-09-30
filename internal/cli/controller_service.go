@@ -1770,7 +1770,10 @@ func (s *controllerService) reconcileProvisioning(record controllerWorkspaceReco
 		return
 	}
 	s.markProvisioningWaiting(record.Request.ID)
-	s.scheduleReconcile(record.Request.ID)
+	// Warmup succeeded, so the workspace is most likely ready now. Inspect it
+	// at once rather than after the retry delay; enqueue runs it again after
+	// this reconcile if it is still active.
+	s.scheduleReconcileAfter(record.Request.ID, 0, "")
 }
 
 func (s *controllerService) stopWorkspace(record controllerWorkspaceRecord) {
